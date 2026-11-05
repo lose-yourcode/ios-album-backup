@@ -1,1 +1,3 @@
-pymobiledevice3>=4
+# iOS USB 通信库。v1.0 起程序直接 import 它的 Python 接口做 AFC 导出，
+# 全程复用一条 USB 连接，速度远快于旧的命令行子进程方式。
+pymobiledevice3>=9
