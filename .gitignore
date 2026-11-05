@@ -1,0 +1,26 @@
+# ===== 用户数据 / 隐私文件，一律不入库 =====
+# 相簿导出（约 8GB 照片视频 + 导出日志 CSV）
+album_exports/
+# Photos.sqlite 元数据快照（含个人照片库元数据）
+ios_photo_metadata/
+# iOS 整机备份
+ios_device_backups/
+# 本地导出索引数据库（含照片路径、GUID 等个人信息）
+ios_album_backup_index.sqlite
+ios_album_backup_index.sqlite-shm
+ios_album_backup_index.sqlite-wal
+# 本机配置
+ios_album_backup_config.json
+# 根目录下可能散落的日志/清单
+export_log_*.csv
+delete_review_*.csv
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# ===== 系统 =====
+Thumbs.db
+.DS_Store
