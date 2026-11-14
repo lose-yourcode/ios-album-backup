@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-iOS Photos album backup TUI for Windows (v1.0).
+iOS Photos album backup TUI for Windows (v1.1).
 
 This tool avoids manual PTP/DCIM browsing. It reads Photos.sqlite to recover
 Photos album structure, then exports matching DCIM media paths directly over
-AFC (in-process, single USB connection), or from a local iOS logic backup.
+AFC (in-process, single USB connection).
 
 Copyright (C) 2026  lose-yourcode
 
@@ -36,21 +36,20 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable
 
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "ios_album_backup_config.json"
 DEFAULT_INDEX_PATH = APP_DIR / "ios_album_backup_index.sqlite"
-DEFAULT_BACKUP_ROOT = APP_DIR / "ios_device_backups"
 DEFAULT_EXPORT_ROOT = APP_DIR / "album_exports"
 DEFAULT_METADATA_ROOT = APP_DIR / "ios_photo_metadata"
 IPHONE_EPOCH_OFFSET = 978307200
@@ -61,8 +60,8 @@ CHUNK_SIZE = 4 * 1024 * 1024
 SQL_COMMIT_EVERY = 32
 # 导出 CSV 每累计 N 行落盘一次，中断时已完成部分仍在。
 CSV_FLUSH_EVERY = 20
-# 进度行刷新间隔（按资产数）。
-PROGRESS_EVERY = 25
+# 周期性汇总行的间隔（按资产数）。逐文件的进度在拉取时实时显示。
+PROGRESS_EVERY = 50
 
 
 IMAGE_EXTENSIONS = {
@@ -83,19 +82,6 @@ SIDECAR_EXTENSIONS = {".aae", ".mov"}
 
 
 @dataclass
-class ManifestRecord:
-    file_id: str
-    domain: str
-    relative_path: str
-    physical_path: Path
-    size: int = 0
-
-    @property
-    def key(self) -> str:
-        return f"{self.domain}:{normalize_relpath(self.relative_path)}"
-
-
-@dataclass
 class AFCRecord:
     remote_path: str
     relative_path: str
@@ -105,9 +91,6 @@ class AFCRecord:
     @property
     def key(self) -> str:
         return f"AFC:{normalize_relpath(self.remote_path)}"
-
-
-MediaRecord = ManifestRecord | AFCRecord
 
 
 @dataclass
@@ -176,6 +159,19 @@ class AppError(Exception):
 
 def now_stamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+# 多线程共用控制台：后台拉取线程和主线程都打印进度行，加锁防止半行串写。
+PRINT_LOCK = threading.Lock()
+
+
+def human_size(num_bytes: float) -> str:
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024
+    return f"{value:.1f}GB"
 
 
 def normalize_relpath(value: str) -> str:
@@ -442,8 +438,11 @@ class AFCServiceSource(AFCMediaSourceBase):
         afc = self._afc
         stat = await afc.stat(remote)
         src_size = int(stat["st_size"])
+        name = remote.rsplit("/", 1)[-1] or remote
         hasher = hashlib.sha256()
         size = 0
+        start = time.monotonic()
+        big_file = src_size > CHUNK_SIZE
         with dest_path.open("wb") as dst:
             handle = await afc.fopen(remote, "r")
             try:
@@ -457,8 +456,23 @@ class AFCServiceSource(AFCMediaSourceBase):
                     dst.write(chunk)
                     size += len(chunk)
                     remaining -= len(chunk)
+                    if big_file:
+                        elapsed = time.monotonic() - start
+                        speed = size / elapsed if elapsed > 0 else 0.0
+                        with PRINT_LOCK:
+                            print(
+                                f"\r  ↳ {name}  {human_size(size)}/{human_size(src_size)}"
+                                f"  {human_size(speed)}/s   ",
+                                end="",
+                                flush=True,
+                            )
             finally:
                 await afc.fclose(handle)
+        elapsed = time.monotonic() - start
+        speed = size / elapsed if elapsed > 0 else 0.0
+        summary = f"{human_size(size)}  {elapsed:.1f}s  {human_size(speed)}/s"
+        with PRINT_LOCK:
+            print(f"\r  ↳ {name}  {summary}   " if big_file else f"  ↳ {name}  {summary}")
         try:
             mtime = stat["st_mtime"].timestamp()
             os.utime(dest_path, (mtime, mtime))
@@ -470,6 +484,8 @@ class AFCServiceSource(AFCMediaSourceBase):
         try:
             return self._call(self._pull_file_coro(remote, dest_path))
         except self._pmd3_exceptions.AfcException as exc:
+            with PRINT_LOCK:
+                print()  # 收掉可能停留在半行的进度行
             if dest_path.exists():
                 dest_path.unlink()
             raise AppError(f"AFC 拉取失败：{remote}（{exc}）") from exc
@@ -505,180 +521,43 @@ def make_afc_media_source() -> AFCMediaSourceBase:
         raise AppError(friendly_afc_connect_error(exc)) from exc
 
 
-def pull_photos_metadata(metadata_root: Path, media_source: AFCMediaSourceBase) -> Path:
-    snapshot_dir = metadata_root / now_stamp()
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    files = [
-        "PhotoData/Photos.sqlite",
-        "PhotoData/Photos.sqlite-wal",
-        "PhotoData/Photos.sqlite-shm",
-    ]
-    sqlite_pulled = False
-    for remote in files:
-        local = snapshot_dir / Path(remote).name
+def refresh_photos_metadata(metadata_root: Path) -> Path:
+    """从手机拉取 Photos.sqlite 到 metadata_root 下的单个工作文件（覆盖旧副本）。
+
+    相簿结构数据库只是临时工作数据：相簿一变它就过时了，所以不再按时间戳
+    留存多份快照，每次刷新直接覆盖。主文件先拉到 .part 再原子替换，
+    避免中途断开留下截断的数据库。
+    """
+    media_source = make_afc_media_source()
+    try:
+        metadata_root.mkdir(parents=True, exist_ok=True)
+        main_path = metadata_root / "Photos.sqlite"
+        part_path = metadata_root / "Photos.sqlite.part"
+        for stale in (metadata_root / "Photos.sqlite-wal", metadata_root / "Photos.sqlite-shm"):
+            if stale.exists():
+                stale.unlink()
         try:
-            media_source.pull_file(remote, local)
+            media_source.pull_file("PhotoData/Photos.sqlite", part_path)
         except AppError:
-            if remote.endswith("Photos.sqlite"):
-                raise AppError("没有成功读取 PhotoData/Photos.sqlite。请确认手机已解锁并信任此电脑。")
-            print(f"提示：{remote} 没有拉取到（只可能缺少最近一次改动，不影响使用）。")
-            continue
-        if remote.endswith("Photos.sqlite"):
-            sqlite_pulled = True
-    if not sqlite_pulled or not (snapshot_dir / "Photos.sqlite").exists():
-        raise AppError("没有找到拉取后的 Photos.sqlite。")
-    print(f"\n相簿元数据已保存：{snapshot_dir}")
-    return snapshot_dir
-
-
-# ============================================================================
-# 备用方案：含媒体逻辑备份（backup2）
-# ----------------------------------------------------------------------------
-# AFC 直连已经是主方案。这一段只在你想先离线保存一份 iOS 允许备份的媒体、
-# 之后不连手机反复导出相簿时才需要。与主流程互不依赖。
-# ============================================================================
-
-
-def create_ios_backup(backup_root: Path, metadata_root: Path) -> tuple[str, Path] | None:
-    exe = find_pymobiledevice3()
-    if not exe:
-        print_missing_pymobiledevice3()
-        return None
-    backup_root.mkdir(parents=True, exist_ok=True)
-    print("\n选择 iOS 备份类型：")
-    print("1. 仅相簿元数据：直接读取 PhotoData/Photos.sqlite，用于查看相簿结构（推荐先用这个）")
-    print("2. 含媒体逻辑备份：备用离线方案，先把可备份媒体放到本地，再按相簿导出")
-    mode = prompt("选择", "1")
-    if mode == "1":
-        print("\n准备直接读取 iOS 相簿元数据（不是媒体/App 备份）。")
-        print("这个模式通常只需要几秒到几十秒；导出照片/视频时保持手机连接即可。")
-        media_source = make_afc_media_source()
-        try:
-            return ("metadata", pull_photos_metadata(metadata_root, media_source))
-        finally:
-            media_source.close()
-    elif mode == "2":
-        command = [exe, "backup2", "backup", "--full", str(backup_root)]
-        print("\n准备创建 iOS 含媒体逻辑备份（备用离线方案，不是整机 NAND 镜像）。")
-    else:
-        print("已取消。")
-        return None
-    print("手机需要：USB 连接、解锁、信任此电脑；过程中可能要求输入锁屏密码。")
-    print("如果你启用了 iCloud 照片并且手机是“优化 iPhone 储存空间”，部分原片可能不在本机备份里。")
-    answer = prompt("开始？输入 y 继续", "n").lower()
-    if answer != "y":
-        return None
-    code = run_streaming(command)
-    if code == 0:
-        print("\n备份完成。")
-        return ("backup", backup_root)
-    print(f"\n备份命令退出码：{code}")
-    return None
-
-
-class BackupIndex:
-    def __init__(self, backup_path: Path, records: list[ManifestRecord]) -> None:
-        self.backup_path = backup_path
-        self.records = records
-        self.by_key: dict[tuple[str, str], ManifestRecord] = {}
-        self.by_relpath: dict[str, list[ManifestRecord]] = {}
-        self.by_directory: dict[tuple[str, str], list[ManifestRecord]] = {}
-        for record in records:
-            rel = normalize_relpath(record.relative_path)
-            self.by_key[(record.domain, rel)] = record
-            self.by_relpath.setdefault(rel.lower(), []).append(record)
-            directory = str(Path(rel).parent).replace("\\", "/").lower()
-            filename = Path(rel).name.lower()
-            self.by_directory.setdefault((directory, filename), []).append(record)
-
-    @classmethod
-    def load(cls, backup_path: Path) -> "BackupIndex":
-        manifest = backup_path / "Manifest.db"
-        if not manifest.exists():
-            raise AppError(f"找不到 Manifest.db：{manifest}")
-        try:
-            conn = sqlite3.connect(str(manifest))
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute("SELECT fileID, domain, relativePath FROM Files").fetchall()
-        except sqlite3.DatabaseError as exc:
-            raise AppError(
-                "Manifest.db 不能直接读取。这个备份可能是加密备份；请先关闭本次备份加密，"
-                "或用 pyiosbackup 解密后再让本工具读取解密目录。"
-            ) from exc
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-        records: list[ManifestRecord] = []
-        for row in rows:
-            file_id = row["fileID"]
-            if not file_id:
-                continue
-            physical = backup_path / file_id[:2] / file_id
-            if not physical.exists():
-                flat = backup_path / file_id
-                physical = flat if flat.exists() else physical
-            size = physical.stat().st_size if physical.exists() else 0
-            records.append(
-                ManifestRecord(
-                    file_id=file_id,
-                    domain=row["domain"],
-                    relative_path=row["relativePath"] or "",
-                    physical_path=physical,
-                    size=size,
-                )
-            )
-        return cls(backup_path, records)
-
-    def find_exact(self, domain: str, relpath: str) -> ManifestRecord | None:
-        return self.by_key.get((domain, normalize_relpath(relpath)))
-
-    def find_photos_sqlite(self) -> tuple[Path, tempfile.TemporaryDirectory[str]]:
-        candidates = [
-            self.find_exact("CameraRollDomain", "Media/PhotoData/Photos.sqlite"),
-            self.find_exact("MediaDomain", "Media/PhotoData/Photos.sqlite"),
-        ]
-        candidates.extend(
-            record
-            for record in self.records
-            if normalize_relpath(record.relative_path).lower().endswith("photodata/photos.sqlite")
-        )
-        record = next((item for item in candidates if item and item.physical_path.exists()), None)
-        if not record:
-            raise AppError("备份里找不到 CameraRollDomain/Media/PhotoData/Photos.sqlite。")
-
-        temp_dir = tempfile.TemporaryDirectory(prefix="ios_photos_sqlite_")
-        temp_path = Path(temp_dir.name) / "Photos.sqlite"
-        shutil.copy2(record.physical_path, temp_path)
+            if part_path.exists():
+                part_path.unlink()
+            raise AppError("没有成功读取 PhotoData/Photos.sqlite。请确认手机已解锁并信任此电脑。")
+        os.replace(part_path, main_path)
         for suffix in ("-wal", "-shm"):
-            sidecar = self.find_exact(record.domain, record.relative_path + suffix)
-            if sidecar and sidecar.physical_path.exists():
-                shutil.copy2(sidecar.physical_path, Path(temp_dir.name) / f"Photos.sqlite{suffix}")
-        return temp_path, temp_dir
+            try:
+                media_source.pull_file(f"PhotoData/Photos.sqlite{suffix}", metadata_root / f"Photos.sqlite{suffix}")
+            except AppError:
+                print(f"提示：Photos.sqlite{suffix} 没有拉取到（只可能缺少最近一次改动，不影响使用）。")
+        print(f"\n相簿元数据已更新：{main_path}")
+        return metadata_root
+    finally:
+        media_source.close()
 
-    def find_media_for_asset(self, asset: Asset) -> list[ManifestRecord]:
-        direct_candidates = [
-            self.find_exact("CameraRollDomain", asset.rel_media_path),
-            self.find_exact("MediaDomain", asset.rel_media_path),
-        ]
-        rel_matches = self.by_relpath.get(asset.rel_media_path.lower(), [])
-        records: list[ManifestRecord] = []
-        for record in direct_candidates + rel_matches:
-            if record and record.physical_path.exists() and record not in records:
-                records.append(record)
 
-        stem = Path(asset.filename).stem.lower()
-        media_dir = str(Path(asset.rel_media_path).parent).replace("\\", "/").lower()
-        for ext in SIDECAR_EXTENSIONS:
-            if asset.ext == ext:
-                continue
-            related_name = f"{stem}{ext}".lower()
-            for record in self.by_directory.get((media_dir, related_name), []):
-                if record.physical_path.exists() and record not in records:
-                    records.append(record)
-        return records
+# ============================================================================
+# 备用方案：含媒体逻辑备份（backup2）已于 v1.1 移除。
+# AFC 直连导出覆盖全部日常场景，完整备份请使用 iTunes/访达 或 iCloud。
+# ============================================================================
 
 
 class PhotosParser:
@@ -1244,94 +1123,10 @@ class BackupCatalog:
 # ============================================================================
 
 
-def choose_backup(backup_root: Path) -> Path | None:
-    candidates = find_backup_candidates(backup_root)
-    if not candidates:
-        print(f"没有在 {backup_root} 找到 iOS 备份。")
-        manual = prompt("可以输入已有备份目录，或直接回车取消")
-        if not manual:
-            return None
-        path = Path(manual).expanduser()
-        return path if (path / "Manifest.db").exists() else None
-
-    print("\n找到这些备份：")
-    for index, path in enumerate(candidates, start=1):
-        mtime = dt.datetime.fromtimestamp((path / "Manifest.db").stat().st_mtime)
-        print(f"{index:>2}. {path}  ({mtime:%Y-%m-%d %H:%M:%S})")
-    value = prompt("选择备份编号", "1")
-    try:
-        selected = int(value)
-    except ValueError:
-        return None
-    if selected < 1 or selected > len(candidates):
-        return None
-    return candidates[selected - 1]
-
-
-def choose_metadata(metadata_root: Path) -> Path | None:
-    candidates = find_metadata_candidates(metadata_root)
-    if not candidates:
-        print(f"没有在 {metadata_root} 找到 Photos.sqlite 元数据快照。")
-        manual = prompt("可以输入包含 Photos.sqlite 的目录，或直接回车取消")
-        if not manual:
-            return None
-        path = Path(manual).expanduser()
-        return path if (path / "Photos.sqlite").exists() else None
-
-    print("\n找到这些元数据快照：")
-    for index, path in enumerate(candidates, start=1):
-        mtime = dt.datetime.fromtimestamp((path / "Photos.sqlite").stat().st_mtime)
-        print(f"{index:>2}. {path}  ({mtime:%Y-%m-%d %H:%M:%S})")
-    value = prompt("选择元数据编号", "1")
-    try:
-        selected = int(value)
-    except ValueError:
-        return None
-    if selected < 1 or selected > len(candidates):
-        return None
-    return candidates[selected - 1]
-
-
-def find_backup_candidates(root: Path) -> list[Path]:
-    if not root.exists():
-        return []
-    candidates: list[Path] = []
-    if (root / "Manifest.db").exists():
-        candidates.append(root)
-    for manifest in root.glob("*/Manifest.db"):
-        candidates.append(manifest.parent)
-    for manifest in root.glob("*/*/Manifest.db"):
-        candidates.append(manifest.parent)
-    unique = sorted(set(candidates), key=lambda p: (p / "Manifest.db").stat().st_mtime, reverse=True)
-    return unique
-
-
-def find_metadata_candidates(root: Path) -> list[Path]:
-    if not root.exists():
-        return []
-    candidates: list[Path] = []
-    if (root / "Photos.sqlite").exists():
-        candidates.append(root)
-    for sqlite_path in root.glob("*/Photos.sqlite"):
-        candidates.append(sqlite_path.parent)
-    return sorted(set(candidates), key=lambda p: (p / "Photos.sqlite").stat().st_mtime, reverse=True)
-
-
-def load_library_from_backup(backup_path: Path) -> tuple[BackupIndex, PhotosLibrary, tempfile.TemporaryDirectory[str]]:
-    index = BackupIndex.load(backup_path)
-    db_path, temp_dir = index.find_photos_sqlite()
-    parser = PhotosParser(db_path)
-    try:
-        library = parser.parse()
-    finally:
-        parser.close()
-    return index, library, temp_dir
-
-
-def load_library_from_metadata(metadata_path: Path) -> PhotosLibrary:
-    db_path = metadata_path / "Photos.sqlite" if metadata_path.is_dir() else metadata_path
+def load_library_from_metadata(metadata_root: Path) -> PhotosLibrary:
+    db_path = metadata_root / "Photos.sqlite" if metadata_root.is_dir() else metadata_root
     if not db_path.exists():
-        raise AppError(f"找不到 Photos.sqlite：{db_path}")
+        raise AppError(f"没有找到相簿元数据：{db_path}。请先执行菜单 2 从手机获取。")
     parser = PhotosParser(db_path)
     try:
         return parser.parse()
@@ -1339,25 +1134,18 @@ def load_library_from_metadata(metadata_path: Path) -> PhotosLibrary:
         parser.close()
 
 
-def load_metadata_source(selected: Path) -> tuple[AFCMediaSourceBase, PhotosLibrary]:
-    """加载相簿元数据快照并准备 AFC 媒体源（菜单 2/3 共用）。"""
+def load_metadata_source(metadata_root: Path) -> tuple[AFCMediaSourceBase, PhotosLibrary]:
+    """加载相簿元数据并准备 AFC 媒体源（菜单 2 共用）。"""
     media_source = make_afc_media_source()
-    library = load_library_from_metadata(selected)
-    print_library_summary(library, selected, media_source)
+    library = load_library_from_metadata(metadata_root)
+    print_library_summary(library, metadata_root, media_source)
     return media_source, library
-
-
-def load_backup_source(selected: Path) -> tuple[BackupIndex, PhotosLibrary, tempfile.TemporaryDirectory[str]]:
-    """加载含媒体 iOS 备份（菜单 2/3 共用）。"""
-    index, library, temp_dir = load_library_from_backup(selected)
-    print_library_summary(library, selected, index)
-    return index, library, temp_dir
 
 
 def print_library_summary(
     library: PhotosLibrary,
     source_path: Path,
-    media_source: BackupIndex | AFCMediaSourceBase | None = None,
+    media_source: AFCMediaSourceBase | None = None,
 ) -> None:
     print("\n已加载来源：", source_path)
     print("Photos 数据库：", library.db_path)
@@ -1370,8 +1158,6 @@ def print_library_summary(
         print("导出方式：进程内 AFC 直连（快）")
     elif isinstance(media_source, AFCMediaSource):
         print("导出方式：命令行 AFC 直连（慢，建议 pip 安装 pymobiledevice3 后重试）")
-    elif isinstance(media_source, BackupIndex):
-        print("导出方式：本地含媒体备份（离线）")
 
 
 def list_albums(library: PhotosLibrary) -> None:
@@ -1424,11 +1210,11 @@ def choose_duplicate_policy() -> str:
 
 def choose_date_layout() -> str:
     print("\n导出目录日期分层：")
-    print("1. 按拍摄日期分目录（照片/视频的原始创建日期，推荐）")
-    print("2. 按导出当天日期分目录（旧行为）")
+    print("1. 按导出当天日期分目录（默认：相簿名/导出日/，当天同相簿文件都在同一目录）")
+    print("2. 按拍摄日期分目录（照片/视频的原始创建日期）")
     print("3. 直接放在相簿目录下，不按日期分层")
     value = prompt("选择", "1")
-    return {"1": "shot", "2": "run", "3": "none"}.get(value, "shot")
+    return {"1": "run", "2": "shot", "3": "none"}.get(value, "run")
 
 
 def asset_date_subdir(layout: str, asset: Asset) -> str:
@@ -1495,7 +1281,7 @@ def previous_note(record: dict[str, Any] | None, prefix: str) -> str:
     return "；".join(parts)
 
 
-def media_identity(record: MediaRecord) -> str:
+def media_identity(record: AFCRecord) -> str:
     relpath = normalize_relpath(record.relative_path)
     if relpath.lower().startswith("media/"):
         relpath = relpath[6:]
@@ -1511,18 +1297,8 @@ def destination_filename(asset_filename: str, source_relpath: str, mark_duplicat
     return clean_name
 
 
-def export_media_record(
-    media_source: BackupIndex | AFCMediaSourceBase,
-    record: MediaRecord,
-    dest_path: Path,
-) -> tuple[str, int]:
-    if isinstance(record, AFCRecord):
-        if not isinstance(media_source, AFCMediaSourceBase):
-            raise AppError("AFC 媒体记录需要 AFC 来源。")
-        return media_source.pull(record, dest_path)
-    if not record.physical_path.exists():
-        raise AppError(f"本地备份文件不存在：{record.relative_path}")
-    return copy_with_hash(record.physical_path, dest_path)
+def export_media_record(media_source: AFCMediaSourceBase, record: AFCRecord, dest_path: Path) -> tuple[str, int]:
+    return media_source.pull(record, dest_path)
 
 
 def unique_dest_path(path: Path) -> Path:
@@ -1537,21 +1313,6 @@ def unique_dest_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         counter += 1
-
-
-def copy_with_hash(source: Path, dest: Path) -> tuple[str, int]:
-    hasher = hashlib.sha256()
-    size = 0
-    with source.open("rb") as src, dest.open("wb") as dst:
-        while True:
-            chunk = src.read(1024 * 1024)
-            if not chunk:
-                break
-            hasher.update(chunk)
-            dst.write(chunk)
-            size += len(chunk)
-    shutil.copystat(source, dest, follow_symlinks=True)
-    return hasher.hexdigest(), size
 
 
 def hash_file(path: Path) -> tuple[str, int]:
@@ -1571,7 +1332,7 @@ def log_entry(
     run_id: str,
     album: Album,
     asset: Asset,
-    record: MediaRecord | None,
+    record: AFCRecord | None,
     exported_path: str,
     status: str,
     note: str,
@@ -1600,7 +1361,7 @@ def log_entry(
 
 
 def export_selected_albums(
-    media_source: BackupIndex | AFCMediaSourceBase,
+    media_source: AFCMediaSourceBase,
     library: PhotosLibrary,
     export_root: Path,
     index_path: Path,
@@ -1626,6 +1387,7 @@ def export_selected_albums(
         suffix += 1
         run_id = f"{base_id}_{suffix}"
     started_at = dt.datetime.now().isoformat(timespec="seconds")
+    run_start_mono = time.monotonic()
     run_log = export_root / f"export_log_{run_id}.csv"
     log_writer: ExportLogWriter | None = None
 
@@ -1644,7 +1406,7 @@ def export_selected_albums(
 
         log_writer = ExportLogWriter(run_log)
 
-        def handle_export_failure(record: MediaRecord, message: str) -> None:
+        def handle_export_failure(record: AFCRecord, message: str) -> None:
             nonlocal missing, sidecar_failed
             if isinstance(record, AFCRecord) and not record.required:
                 sidecar_failed += 1
@@ -1780,13 +1542,11 @@ def export_selected_albums(
                         log_writer.write(entry)
 
                     if done % PROGRESS_EVERY == 0 or done == total:
-                        print(
-                            f"\r  进度：{done}/{total}  复制 {copied}  重复 {duplicate_copied}  "
-                            f"跳过 {skipped}  缺失 {missing}",
-                            end="",
-                            flush=True,
-                        )
-                print()
+                        with PRINT_LOCK:
+                            print(
+                                f"  已处理 {done}/{total}：复制 {copied}，重复 {duplicate_copied}，"
+                                f"跳过 {skipped}，缺失 {missing}"
+                            )
         except KeyboardInterrupt:
             interrupted = True
             print("\n\n已中断：已完成的部分仍记录在本次 CSV 里。")
@@ -1811,9 +1571,11 @@ def export_selected_albums(
             pass
 
     print("\n导出完成。" if not interrupted else "\n导出已中断。")
+    run_elapsed = time.monotonic() - run_start_mono
     print(
         f"复制：{copied}，重复复制：{duplicate_copied}，跳过：{skipped}，"
         f"缺失：{missing}，附属文件失败：{sidecar_failed}"
+        f"（耗时 {int(run_elapsed // 60)}分{int(run_elapsed % 60):02d}秒）"
     )
     print(f"索引数据库：{index_path}")
     print(f"本次 CSV：{run_log}")
@@ -1825,7 +1587,7 @@ def export_selected_albums(
 
 
 def make_delete_review(
-    media_source: BackupIndex | AFCMediaSourceBase,
+    media_source: AFCMediaSourceBase,
     library: PhotosLibrary,
     export_root: Path,
 ) -> None:
@@ -1916,13 +1678,11 @@ def load_config() -> dict[str, Any]:
     config = load_json(
         CONFIG_PATH,
         {
-            "backup_root": str(DEFAULT_BACKUP_ROOT),
             "export_root": str(DEFAULT_EXPORT_ROOT),
             "metadata_root": str(DEFAULT_METADATA_ROOT),
             "index_path": str(DEFAULT_INDEX_PATH),
         },
     )
-    config.setdefault("backup_root", str(DEFAULT_BACKUP_ROOT))
     config.setdefault("export_root", str(DEFAULT_EXPORT_ROOT))
     config.setdefault("metadata_root", str(DEFAULT_METADATA_ROOT))
     config.setdefault("index_path", str(DEFAULT_INDEX_PATH))
@@ -1931,10 +1691,9 @@ def load_config() -> dict[str, Any]:
 
 def settings_menu(config: dict[str, Any]) -> dict[str, Any]:
     fields = [
-        ("1", "backup_root", "iOS 备份目录"),
-        ("2", "export_root", "相簿导出目录"),
-        ("3", "metadata_root", "相簿元数据目录"),
-        ("4", "index_path", "导出索引数据库"),
+        ("1", "export_root", "相簿导出目录"),
+        ("2", "metadata_root", "相簿元数据目录"),
+        ("3", "index_path", "导出索引数据库"),
     ]
     print("\n当前设置：")
     for number, key, label in fields:
@@ -1961,43 +1720,36 @@ def settings_menu(config: dict[str, Any]) -> dict[str, Any]:
 
 def main() -> int:
     config = load_config()
-    media_source: BackupIndex | AFCMediaSourceBase | None = None
+    media_source: AFCMediaSourceBase | None = None
     library: PhotosLibrary | None = None
-    temp_dir: tempfile.TemporaryDirectory[str] | None = None
     loaded_source_path: Path | None = None
     loaded_source_kind = "未加载"
 
     def drop_current() -> None:
-        nonlocal media_source, library, temp_dir
-        if temp_dir is not None:
-            temp_dir.cleanup()
+        nonlocal media_source, library
         if media_source is not None:
             media_source.close()
         media_source = None
         library = None
-        temp_dir = None
 
     try:
         while True:
-            backup_root = Path(config["backup_root"]).expanduser()
             export_root = Path(config["export_root"]).expanduser()
             metadata_root = Path(config["metadata_root"]).expanduser()
             index_path = Path(config["index_path"]).expanduser()
             print("\n" + "=" * 64)
             print(f"iOS 相簿备份管理 TUI  v{__version__}")
             print("=" * 64)
-            print(f"备份目录：{backup_root}")
             print(f"元数据目录：{metadata_root}")
             print(f"导出目录：{export_root}")
             print(f"当前来源：{loaded_source_kind} - {loaded_source_path or '未加载'}")
             print("\n1. 检查 USB iPhone 连接")
-            print("2. 获取/刷新数据（仅相簿元数据或含媒体备份）")
-            print("3. 选择并加载现有元数据/备份")
-            print("4. 查看相簿/分类")
-            print("5. 按相簿导出原始文件")
-            print("6. 查看导出记录/重复统计")
-            print("7. 生成待删除清单（不直接删除手机）")
-            print("8. 设置目录")
+            print("2. 获取相簿元数据（从手机读取 Photos.sqlite）")
+            print("3. 查看相簿/分类")
+            print("4. 按相簿导出原始文件")
+            print("5. 查看导出记录/重复统计")
+            print("6. 生成待删除清单（不直接删除手机）")
+            print("7. 设置目录")
             print("0. 退出")
             try:
                 choice = prompt("选择")
@@ -2010,63 +1762,30 @@ def main() -> int:
                     list_connected_devices()
                     press_enter()
                 elif choice == "2":
-                    created = create_ios_backup(backup_root, metadata_root)
-                    if created and created[0] == "metadata":
-                        drop_current()
-                        media_source, library = load_metadata_source(created[1])
-                        loaded_source_path = created[1]
-                        loaded_source_kind = "相簿元数据（AFC直连）"
-                    elif created and created[0] == "backup":
-                        selected = choose_backup(backup_root)
-                        if selected:
-                            drop_current()
-                            media_source, library, temp_dir = load_backup_source(selected)
-                            loaded_source_path = selected
-                            loaded_source_kind = "含媒体备份"
+                    refresh_photos_metadata(metadata_root)
+                    drop_current()
+                    media_source, library = load_metadata_source(metadata_root)
+                    loaded_source_path = metadata_root
+                    loaded_source_kind = "相簿元数据（AFC直连）"
                     press_enter()
                 elif choice == "3":
-                    print("\n1. 加载相簿元数据快照")
-                    print("2. 加载含媒体 iOS 备份")
-                    load_choice = prompt("选择", "1")
-                    if load_choice == "1":
-                        selected = choose_metadata(metadata_root)
-                        if selected:
-                            drop_current()
-                            media_source, library = load_metadata_source(selected)
-                            loaded_source_path = selected
-                            loaded_source_kind = "相簿元数据（AFC直连）"
-                        else:
-                            print("没有加载元数据。")
-                    elif load_choice == "2":
-                        selected = choose_backup(backup_root)
-                        if selected:
-                            drop_current()
-                            media_source, library, temp_dir = load_backup_source(selected)
-                            loaded_source_path = selected
-                            loaded_source_kind = "含媒体备份"
-                        else:
-                            print("没有加载备份。")
-                    else:
-                        print("没有加载任何来源。")
-                    press_enter()
-                elif choice == "4":
                     require_library(library)
                     list_albums(library)
                     press_enter()
-                elif choice == "5":
+                elif choice == "4":
                     require_library(library)
                     require_media_source(media_source)
                     export_selected_albums(media_source, library, export_root, index_path)
                     press_enter()
-                elif choice == "6":
+                elif choice == "5":
                     show_state_summary(index_path)
                     press_enter()
-                elif choice == "7":
+                elif choice == "6":
                     require_library(library)
                     require_media_source(media_source)
                     make_delete_review(media_source, library, export_root)
                     press_enter()
-                elif choice == "8":
+                elif choice == "7":
                     config = settings_menu(config)
                 elif choice == "0":
                     break
@@ -2092,9 +1811,9 @@ def require_library(library: PhotosLibrary | None) -> None:
         raise AppError("请先获取或加载相簿元数据/备份。")
 
 
-def require_media_source(source: BackupIndex | AFCMediaSourceBase | None) -> None:
+def require_media_source(source: AFCMediaSourceBase | None) -> None:
     if source is None:
-        raise AppError("请先加载相簿元数据（AFC直连）或含媒体备份。")
+        raise AppError("请先执行菜单 2 获取相簿元数据。")
 
 
 if __name__ == "__main__":
