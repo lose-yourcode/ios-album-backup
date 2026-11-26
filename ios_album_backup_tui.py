@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-iOS Photos album backup TUI for Windows (v1.1).
+iOS Photos album backup TUI for Windows (v1.2).
 
 This tool avoids manual PTP/DCIM browsing. It reads Photos.sqlite to recover
 Photos album structure, then exports matching DCIM media paths directly over
-AFC (in-process, single USB connection).
+AFC (in-process, single USB or Wi-Fi connection).
 
 Copyright (C) 2026  lose-yourcode
 
@@ -26,13 +26,16 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import csv
 import datetime as dt
 import hashlib
 import json
 import os
+import plistlib
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -44,7 +47,7 @@ from types import SimpleNamespace
 from typing import Any, Iterable
 
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -53,6 +56,23 @@ DEFAULT_INDEX_PATH = APP_DIR / "ios_album_backup_index.sqlite"
 DEFAULT_EXPORT_ROOT = APP_DIR / "album_exports"
 DEFAULT_METADATA_ROOT = APP_DIR / "ios_photo_metadata"
 IPHONE_EPOCH_OFFSET = 978307200
+
+CONNECTION_MODE_AUTO = "auto"
+CONNECTION_MODE_WIFI = "wifi"
+CONNECTION_MODE_USB = "usb"
+CONNECTION_MODE_TCP = "tcp"
+VALID_CONNECTION_MODES = (
+    CONNECTION_MODE_AUTO,
+    CONNECTION_MODE_WIFI,
+    CONNECTION_MODE_USB,
+    CONNECTION_MODE_TCP,
+)
+CONNECTION_MODE_LABELS = {
+    CONNECTION_MODE_AUTO: "自动（USB 优先，未插线自动走 Wi-Fi）",
+    CONNECTION_MODE_WIFI: "仅 Wi-Fi 无线连接",
+    CONNECTION_MODE_USB: "仅 USB 有线连接",
+    CONNECTION_MODE_TCP: "手动 Wi-Fi IP 直连（TCP）",
+}
 
 # 与 pymobiledevice3 的 MAXIMUM_READ_SIZE 一致：单次 AFC 读取 4MB。
 CHUNK_SIZE = 4 * 1024 * 1024
@@ -157,6 +177,11 @@ class AppError(Exception):
     pass
 
 
+class ConnectionLostError(AppError):
+    """底层 USB/Wi-Fi 连接断开且重连失败。"""
+    pass
+
+
 def now_stamp() -> str:
     return dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -249,16 +274,6 @@ def run_streaming(command: list[str]) -> int:
         return 127
 
 
-def list_connected_devices() -> None:
-    exe = find_pymobiledevice3()
-    if not exe:
-        print_missing_pymobiledevice3()
-        return
-    result = subprocess.run([exe, "usbmux", "list"], text=True)
-    if result.returncode != 0:
-        print("没有成功列出设备。请确认 iPhone 已解锁，并点过“信任此电脑”。")
-
-
 def print_missing_pymobiledevice3() -> None:
     print("没有找到 pymobiledevice3。")
     print("请先在 Windows PowerShell 里安装：")
@@ -268,32 +283,52 @@ def print_missing_pymobiledevice3() -> None:
 
 
 # ============================================================================
-# pymobiledevice3 集成：进程内 AFC（快）+ 命令行 AFC（兜底）
+# pymobiledevice3 集成：进程内 AFC（USB / Wi-Fi）+ 命令行 AFC（兜底）
 # ============================================================================
-# v1.0 起导出直接使用 pymobiledevice3 的 Python 接口（requirements.txt 里声明的
-# 依赖从这时起才被真正 import），全程只建立一条 USB 服务连接；
-# 每个文件不再重启子进程。命令行方式保留为兜底方案。
+# v1.0 起导出直接使用 pymobiledevice3 的 Python 接口，全程复用一条连接；
+# v1.2 起支持通过 Wi-Fi 无线连接（usbmux Network / Bonjour mobdev2 / 手动 IP TCP）。
 
 
 def _import_pmd3() -> SimpleNamespace:
     from pymobiledevice3 import exceptions as pmd3_exceptions
-    from pymobiledevice3.lockdown import create_using_usbmux
+    from pymobiledevice3 import usbmux
+    from pymobiledevice3.common import get_home_folder
+    from pymobiledevice3.lockdown import TcpLockdownClient, create_using_tcp, create_using_usbmux
+    from pymobiledevice3.osu.os_utils import get_os_utils
+    from pymobiledevice3.pair_records import get_preferred_pair_record
     from pymobiledevice3.services.afc import AfcService
+
+    try:
+        from pymobiledevice3.bonjour import browse_mobdev2
+    except ImportError:
+        browse_mobdev2 = None
 
     return SimpleNamespace(
         exceptions=pmd3_exceptions,
+        usbmux=usbmux,
+        TcpLockdownClient=TcpLockdownClient,
         create_using_usbmux=create_using_usbmux,
+        create_using_tcp=create_using_tcp,
+        browse_mobdev2=browse_mobdev2,
+        get_home_folder=get_home_folder,
+        get_preferred_pair_record=get_preferred_pair_record,
+        get_os_utils=get_os_utils,
         AfcService=AfcService,
     )
 
 
 def friendly_afc_connect_error(exc: Exception) -> str:
     known = {
-        "NoDeviceConnectedError": "没有通过 USB 检测到 iPhone。请连接数据线、解锁手机，并在弹窗里点“信任此电脑”。",
-        "NotTrustedError": "手机还没有信任此电脑。请解锁 iPhone，在弹窗里点“信任”并输入锁屏密码。",
+        "NoDeviceConnectedError": "没有检测到 iPhone。请插上 USB 数据线，或确认已开启 Wi-Fi 同步且处于同一局域网。",
+        "ConnectionFailedToUsbmuxdError": "无法连接本机 Apple Mobile Device Service (usbmuxd)。如需 USB 或 usbmux Wi-Fi，请确认已安装 iTunes / Apple Devices；也可使用菜单 1 的手动 Wi-Fi IP 直连。",
+        "NotTrustedError": "手机还没有信任此电脑。请先插 USB 解锁 iPhone，在弹窗里点“信任”并输入锁屏密码。",
+        "NotPairedError": "设备尚未与本电脑完成配对。请先插一次 USB 线点“信任此电脑”。",
         "PairingDialogResponsePendingError": "请在 iPhone 上点“信任此电脑”弹窗，然后再试一次。",
-        "PasswordRequiredError": "需要先在手机上输入锁屏密码完成配对。",
-        "InvalidServiceError": "手机拒绝了 AFC 服务请求。请解锁屏幕后重试。",
+        "PasswordRequiredError": "需要先在手机上输入锁屏密码完成配对或解锁。",
+        "InvalidServiceError": "手机拒绝了 AFC 服务请求。请解锁屏幕后重试（重启后需至少解锁一次）。",
+        "StartServiceError": "无法在手机上启动 AFC 服务。请解锁屏幕后重试。",
+        "ConnectionFailedError": "连接 iPhone 失败，请检查 USB 线或 Wi-Fi 网络是否畅通。",
+        "ConnectionTerminatedError": "与 iPhone 的连接已断开。",
     }
     message = known.get(type(exc).__name__)
     if message:
@@ -301,8 +336,695 @@ def friendly_afc_connect_error(exc: Exception) -> str:
     return f"无法连接 iPhone 的 AFC 服务：{type(exc).__name__}: {exc}"
 
 
+@dataclass
+class DiscoveredEndpoint:
+    transport_kind: str  # "usb" | "wifi-usbmux" | "wifi-bonjour" | "wifi-tcp"
+    transport_label: str
+    name: str
+    version: str
+    udid: str = ""
+    paired: bool = False
+    wifi_enabled: bool | None = None
+    serial: str | None = None
+    host: str | None = None
+    error: str | None = None
+
+    @property
+    def is_usb(self) -> bool:
+        return self.transport_kind == "usb"
+
+    @property
+    def is_wifi(self) -> bool:
+        return self.transport_kind != "usb"
+
+
+def _normalize_mac(value: str | None) -> str:
+    return (value or "").strip().lower().replace(":", "").replace("-", "")
+
+
+def _normalize_udid(value: str | None) -> str:
+    return (value or "").strip().lower().replace("-", "")
+
+
+def _load_pair_records(pmd3: SimpleNamespace) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """从 pymobiledevice3 缓存与 Apple Lockdown 目录读取配对记录（仅内存使用，不落盘）。"""
+    by_udid: dict[str, dict[str, Any]] = {}
+    by_mac: dict[str, dict[str, Any]] = {}
+    folders: list[Path] = []
+    for getter in (pmd3.get_home_folder, lambda: pmd3.get_os_utils().pair_record_path):
+        try:
+            folder = getter()
+        except Exception:
+            continue
+        if folder and folder not in folders and folder.exists():
+            folders.append(folder)
+
+    for folder in folders:
+        try:
+            files = list(folder.glob("*.plist"))
+        except OSError:
+            continue
+        for file in files:
+            if file.name.startswith("remote_"):
+                continue
+            try:
+                record = plistlib.loads(file.read_bytes())
+            except (OSError, plistlib.InvalidFileException):
+                continue
+            if not isinstance(record, dict):
+                continue
+            udid_key = _normalize_udid(file.stem)
+            if udid_key and udid_key not in by_udid:
+                by_udid[udid_key] = record
+            mac_key = _normalize_mac(record.get("WiFiMACAddress"))
+            if mac_key and mac_key not in by_mac:
+                by_mac[mac_key] = record
+    return by_udid, by_mac
+
+
+async def _safe_close_lockdown(lockdown: Any) -> None:
+    if lockdown is None:
+        return
+    try:
+        await lockdown.close()
+    except Exception:
+        pass
+
+
+def _collect_dns_sd_lines(args: list[str], max_wait: float, stop_pattern: re.Pattern[str] | None = None, idle_grace: float = 0.35) -> list[str]:
+    """运行持续输出型的 Windows dns-sd 命令，并在匹配目标或短时无新输出后提前结束。"""
+    exe = shutil.which("dns-sd")
+    if not exe:
+        return []
+    proc = subprocess.Popen(
+        [exe, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    lines: list[str] = []
+    matched_event = threading.Event()
+    last_activity = [time.monotonic()]
+
+    def reader() -> None:
+        assert proc.stdout is not None
+        try:
+            for line in proc.stdout:
+                text = line.rstrip("\r\n")
+                if not text:
+                    continue
+                lines.append(text)
+                last_activity[0] = time.monotonic()
+                if stop_pattern is not None and stop_pattern.search(text):
+                    matched_event.set()
+                    break
+        except Exception:
+            pass
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    deadline = time.monotonic() + max_wait
+    try:
+        while time.monotonic() < deadline:
+            if matched_event.is_set() or proc.poll() is not None:
+                break
+            if lines and stop_pattern is None and (time.monotonic() - last_activity[0]) >= idle_grace:
+                # 跳过前两行表头，至少收到一条记录后再提前结束
+                if any(" Add " in item for item in lines):
+                    break
+            time.sleep(0.05)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        t.join(timeout=0.5)
+    return lines
+
+
+def _discover_dns_sd_hosts_sync() -> list[tuple[str, list[str]]]:
+    """通过 Windows Bonjour (dns-sd.exe) 发现 _apple-mobdev2._tcp 实例及其 IP 地址。"""
+    browse_lines = _collect_dns_sd_lines(["-B", "_apple-mobdev2._tcp", "local."], max_wait=1.8)
+    instances: list[str] = []
+    for line in browse_lines:
+        m = re.search(r"\sAdd\s+\d+\s+\d+\s+\S+\s+_apple-mobdev2\._tcp\.\s+(.+)$", line)
+        if m:
+            inst = m.group(1).strip()
+            if inst not in instances:
+                instances.append(inst)
+    if not instances:
+        return []
+
+    reach_re = re.compile(r"can be reached at\s+(.+?):(\d+)")
+    results: list[tuple[str, list[str]]] = []
+    for inst in instances:
+        mac_hint = inst.split("@", 1)[0] if "@" in inst else ""
+        resolve_lines = _collect_dns_sd_lines(
+            ["-L", inst, "_apple-mobdev2._tcp", "local."],
+            max_wait=1.2,
+            stop_pattern=reach_re,
+        )
+        target = ""
+        for line in resolve_lines:
+            m = reach_re.search(line)
+            if m:
+                target = m.group(1).strip().rstrip(".")
+                break
+        if not target:
+            continue
+
+        ips: list[str] = []
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                infos = socket.getaddrinfo(target, 62078, family, socket.SOCK_STREAM)
+            except OSError:
+                continue
+            for info in infos:
+                addr = info[4][0]
+                if addr not in ips:
+                    ips.append(addr)
+
+        if not ips:
+            v4_re = re.compile(r"\sAdd\s+\d+\s+\d+\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s+")
+            g_lines = _collect_dns_sd_lines(["-G", "v4", target], max_wait=1.2, stop_pattern=v4_re)
+            for line in g_lines:
+                m = v4_re.search(line)
+                if m and m.group(1) not in ips:
+                    ips.append(m.group(1))
+
+        if ips:
+            results.append((mac_hint, ips))
+    return results
+
+
+def _candidate_pair_records(
+    by_udid: dict[str, dict[str, Any]],
+    by_mac: dict[str, dict[str, Any]],
+    mac_hint: str = "",
+    target_udid: str = "",
+) -> list[dict[str, Any]]:
+    ordered: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+
+    def add(rec: dict[str, Any] | None) -> None:
+        if rec is not None and id(rec) not in seen_ids:
+            seen_ids.add(id(rec))
+            ordered.append(rec)
+
+    if target_udid:
+        add(by_udid.get(_normalize_udid(target_udid)))
+    if mac_hint:
+        add(by_mac.get(_normalize_mac(mac_hint)))
+    if not target_udid:
+        # iOS 私有无线局域网地址下，Bonjour 广播 MAC 可能与硬件 WiFiMACAddress 不同，逐一校验本地配对记录。
+        for rec in by_udid.values():
+            add(rec)
+    return ordered
+
+
+async def _connect_tcp_lockdown(
+    pmd3: SimpleNamespace,
+    hostname: str,
+    pair_record: dict[str, Any] | None = None,
+    mac_hint: str = "",
+    target_udid: str = "",
+    timeout: float = 6.0,
+) -> Any:
+    """建立已验证配对的 Wi-Fi TCP Lockdown 连接。"""
+    if pair_record is not None:
+        records = [pair_record]
+    else:
+        by_udid, by_mac = _load_pair_records(pmd3)
+        records = _candidate_pair_records(by_udid, by_mac, mac_hint=mac_hint, target_udid=target_udid)
+
+    for rec in records:
+        cand = None
+        try:
+            cand = await asyncio.wait_for(
+                pmd3.create_using_tcp(hostname=hostname, autopair=False, pair_record=rec),
+                timeout=timeout,
+            )
+        except Exception:
+            await _safe_close_lockdown(cand)
+            # 若 TCP 本身连通失败，后续记录也无需继续试同一个 IP
+            raise
+        if cand.paired:
+            if target_udid and _normalize_udid(cand.udid) != _normalize_udid(target_udid):
+                await _safe_close_lockdown(cand)
+                continue
+            return cand
+        await _safe_close_lockdown(cand)
+
+    # 没有任何本地配对记录匹配时，仅做一次无配对探活以区分“设备不可达”与“未配对”
+    probe = await asyncio.wait_for(
+        pmd3.create_using_tcp(hostname=hostname, autopair=False),
+        timeout=timeout,
+    )
+    await _safe_close_lockdown(probe)
+    raise AppError(
+        f"已连上 {hostname}，但未找到匹配的信任配对记录。"
+        "请先插一次 USB 线点“信任此电脑”，并在菜单 1 开启 Wi-Fi 同步。"
+    )
+
+
+async def _probe_tcp_unpaired_info(pmd3: SimpleNamespace, hostname: str, timeout: float = 4.0) -> dict[str, str] | None:
+    cand = None
+    try:
+        cand = await asyncio.wait_for(
+            pmd3.create_using_tcp(hostname=hostname, autopair=False),
+            timeout=timeout,
+        )
+        vals = cand.all_values or {}
+        return {
+            "name": vals.get("DeviceName") or hostname,
+            "version": vals.get("ProductVersion") or "?",
+        }
+    except Exception:
+        return None
+    finally:
+        await _safe_close_lockdown(cand)
+
+
+async def _discover_bonjour_candidates(
+    pmd3: SimpleNamespace,
+    timeout: float = 2.5,
+) -> list[tuple[str, list[str]]]:
+    """发现局域网内通过 Bonjour 广播的 iOS 设备，返回 [(mac_hint, [ip, ...]), ...]。"""
+    dns_sd_hosts = await asyncio.to_thread(_discover_dns_sd_hosts_sync)
+    if dns_sd_hosts:
+        return dns_sd_hosts
+
+    if pmd3.browse_mobdev2 is None:
+        return []
+    try:
+        instances = await pmd3.browse_mobdev2(timeout=timeout)
+    except Exception:
+        return []
+
+    results: list[tuple[str, list[str]]] = []
+    for answer in instances:
+        mac_hint = answer.instance.split("@", 1)[0] if "@" in answer.instance else ""
+        ips = [addr.full_ip for addr in answer.addresses if addr.full_ip]
+        if ips:
+            results.append((mac_hint, ips))
+    return results
+
+
+async def _discover_bonjour_lockdowns(
+    pmd3: SimpleNamespace,
+    target_udid: str = "",
+    timeout: float = 2.5,
+) -> list[tuple[str, Any]]:
+    candidates = await _discover_bonjour_candidates(pmd3, timeout=timeout)
+    if not candidates:
+        return []
+
+    connected: list[tuple[str, Any]] = []
+    seen_udids: set[str] = set()
+    for mac_hint, ips in candidates:
+        for ip in ips:
+            try:
+                lockdown = await _connect_tcp_lockdown(
+                    pmd3,
+                    ip,
+                    mac_hint=mac_hint,
+                    target_udid=target_udid,
+                    timeout=5.0,
+                )
+            except Exception:
+                continue
+            udid = _normalize_udid(getattr(lockdown, "udid", None))
+            if udid and udid in seen_udids:
+                await _safe_close_lockdown(lockdown)
+                break
+            if udid:
+                seen_udids.add(udid)
+            connected.append((ip, lockdown))
+            break
+    return connected
+
+
+async def _run_heartbeat(lockdown: Any, ready_event: asyncio.Event) -> None:
+    """为 Wi-Fi TCP 直连维持 com.apple.mobile.heartbeat 心跳，避免 iOS 立即关闭 AFC 服务。"""
+    service = None
+    try:
+        service = await lockdown.start_lockdown_service("com.apple.mobile.heartbeat")
+        ready_event.set()
+        while True:
+            await service.recv_plist()
+            await service.send_plist({"Command": "Polo"})
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+    finally:
+        ready_event.set()
+        if service is not None:
+            with contextlib.suppress(Exception):
+                await service.close()
+
+
+async def _connect_usbmux_device(
+    pmd3: SimpleNamespace,
+    serial: str,
+    connection_type: str,
+    autopair: bool,
+) -> Any:
+    lockdown = await pmd3.create_using_usbmux(
+        serial=serial,
+        connection_type=connection_type,
+        autopair=autopair,
+    )
+    if not lockdown.paired:
+        await _safe_close_lockdown(lockdown)
+        raise AppError(
+            "设备尚未配对或信任已失效。请先插一次 USB 线解锁手机并在弹窗中点“信任此电脑”。"
+        )
+    return lockdown
+
+
+async def _discover_all_endpoints_coro(
+    pmd3: SimpleNamespace,
+    wifi_host: str = "",
+) -> tuple[list[DiscoveredEndpoint], str | None]:
+    """枚举当前可达的 USB / Wi-Fi (usbmux / Bonjour / 手动 IP) 设备端点（不落盘）。"""
+    endpoints: list[DiscoveredEndpoint] = []
+    mux_error: str | None = None
+    seen_wifi_udids: set[str] = set()
+    seen_wifi_hosts: set[str] = set()
+
+    try:
+        mux_devices = await pmd3.usbmux.list_devices()
+    except Exception as exc:
+        mux_devices = []
+        mux_error = f"{type(exc).__name__}: {exc}"
+
+    for dev in mux_devices:
+        kind = "usb" if dev.is_usb else "wifi-usbmux"
+        label = "USB" if dev.is_usb else "Wi-Fi (usbmux)"
+        ep = DiscoveredEndpoint(
+            transport_kind=kind,
+            transport_label=label,
+            name="iPhone",
+            version="?",
+            serial=dev.serial,
+        )
+        lockdown = None
+        try:
+            lockdown = await pmd3.create_using_usbmux(
+                serial=dev.serial,
+                connection_type=dev.connection_type,
+                autopair=False,
+            )
+            vals = lockdown.all_values or {}
+            ep.name = vals.get("DeviceName") or "iPhone"
+            ep.version = vals.get("ProductVersion") or "?"
+            ep.udid = _normalize_udid(lockdown.udid or dev.serial)
+            ep.paired = bool(lockdown.paired)
+            if lockdown.paired:
+                try:
+                    ep.wifi_enabled = await lockdown.get_enable_wifi_connections()
+                except Exception:
+                    ep.wifi_enabled = None
+            if not dev.is_usb and ep.udid:
+                seen_wifi_udids.add(ep.udid)
+        except Exception as exc:
+            ep.error = friendly_afc_connect_error(exc)
+        finally:
+            await _safe_close_lockdown(lockdown)
+        endpoints.append(ep)
+
+    bonjour_candidates = await _discover_bonjour_candidates(pmd3, timeout=2.5)
+    for mac_hint, ips in bonjour_candidates:
+        connected_lockdown = None
+        connected_ip = ""
+        last_err: Exception | None = None
+        for ip in ips:
+            try:
+                connected_lockdown = await _connect_tcp_lockdown(
+                    pmd3,
+                    ip,
+                    mac_hint=mac_hint,
+                    timeout=4.5,
+                )
+                connected_ip = ip
+                break
+            except AppError as exc:
+                last_err = exc
+                connected_ip = ip
+                break
+            except Exception as exc:
+                last_err = exc
+
+        if connected_lockdown is not None:
+            try:
+                udid = _normalize_udid(getattr(connected_lockdown, "udid", None))
+                seen_wifi_hosts.add(connected_ip)
+                if udid and udid in seen_wifi_udids:
+                    continue
+                if udid:
+                    seen_wifi_udids.add(udid)
+                vals = connected_lockdown.all_values or {}
+                wifi_enabled = None
+                try:
+                    wifi_enabled = await connected_lockdown.get_enable_wifi_connections()
+                except Exception:
+                    pass
+                endpoints.append(
+                    DiscoveredEndpoint(
+                        transport_kind="wifi-bonjour",
+                        transport_label=f"Wi-Fi (Bonjour {connected_ip})",
+                        name=vals.get("DeviceName") or "iPhone",
+                        version=vals.get("ProductVersion") or "?",
+                        udid=udid,
+                        paired=True,
+                        wifi_enabled=wifi_enabled,
+                        host=connected_ip,
+                    )
+                )
+            finally:
+                await _safe_close_lockdown(connected_lockdown)
+        elif connected_ip and isinstance(last_err, AppError):
+            info = await _probe_tcp_unpaired_info(pmd3, connected_ip)
+            if info:
+                seen_wifi_hosts.add(connected_ip)
+                endpoints.append(
+                    DiscoveredEndpoint(
+                        transport_kind="wifi-bonjour",
+                        transport_label=f"Wi-Fi (Bonjour {connected_ip})",
+                        name=info["name"],
+                        version=info["version"],
+                        paired=False,
+                        host=connected_ip,
+                    )
+                )
+
+    host = (wifi_host or "").strip()
+    if host and host not in seen_wifi_hosts:
+        ep = DiscoveredEndpoint(
+            transport_kind="wifi-tcp",
+            transport_label=f"Wi-Fi (TCP {host})",
+            name=host,
+            version="?",
+            host=host,
+        )
+        lockdown = None
+        try:
+            lockdown = await _connect_tcp_lockdown(pmd3, host, timeout=4.0)
+            vals = lockdown.all_values or {}
+            ep.name = vals.get("DeviceName") or host
+            ep.version = vals.get("ProductVersion") or "?"
+            ep.udid = _normalize_udid(getattr(lockdown, "udid", None))
+            ep.paired = True
+            try:
+                ep.wifi_enabled = await lockdown.get_enable_wifi_connections()
+            except Exception:
+                pass
+        except Exception as exc:
+            ep.error = str(exc) if isinstance(exc, AppError) else f"{type(exc).__name__}: {exc}"
+        finally:
+            await _safe_close_lockdown(lockdown)
+        endpoints.append(ep)
+
+    return endpoints, mux_error
+
+
+async def _open_lockdown(
+    pmd3: SimpleNamespace,
+    connection_mode: str = CONNECTION_MODE_AUTO,
+    wifi_host: str = "",
+    target_udid: str = "",
+    prefer_transport: str = "",
+    preferred_host: str = "",
+) -> tuple[Any, str]:
+    """按配置模式与指定设备建立 Lockdown 连接，返回 (lockdown, 传输方式说明)。"""
+    mode = connection_mode if connection_mode in VALID_CONNECTION_MODES else CONNECTION_MODE_AUTO
+    host = (preferred_host or wifi_host or "").strip()
+    want_udid = _normalize_udid(target_udid)
+
+    mux_devices: list[Any] = []
+    mux_error: Exception | None = None
+    try:
+        mux_devices = await pmd3.usbmux.list_devices()
+    except Exception as exc:
+        mux_error = exc
+
+    def matching_mux(is_usb: bool) -> list[Any]:
+        items = [d for d in mux_devices if (d.is_usb if is_usb else d.is_network)]
+        if want_udid:
+            items = [d for d in items if _normalize_udid(d.serial) == want_udid]
+        return items
+
+    if mode == CONNECTION_MODE_USB:
+        if mux_error is not None:
+            raise AppError(friendly_afc_connect_error(mux_error)) from mux_error
+        usb_devs = matching_mux(True)
+        if not usb_devs:
+            raise AppError("当前设为仅 USB 模式，但未检测到匹配的 USB iPhone。请插好数据线并解锁手机。")
+        lockdown = await _connect_usbmux_device(pmd3, usb_devs[0].serial, "USB", autopair=True)
+        return lockdown, "USB"
+
+    if mode == CONNECTION_MODE_TCP:
+        if not host:
+            raise AppError("当前设为手动 IP 直连，但尚未配置 iPhone 的 Wi-Fi IP。请先进入菜单 1 设置。")
+        try:
+            lockdown = await _connect_tcp_lockdown(pmd3, host, target_udid=want_udid)
+            return lockdown, f"Wi-Fi (TCP {host})"
+        except AppError:
+            raise
+        except Exception as exc:
+            raise AppError(f"无法通过 Wi-Fi TCP 连接到 {host}:62078（{type(exc).__name__}: {exc}）") from exc
+
+    if mode == CONNECTION_MODE_AUTO and prefer_transport != "wifi":
+        usb_devs = matching_mux(True)
+        if usb_devs:
+            lockdown = await _connect_usbmux_device(pmd3, usb_devs[0].serial, "USB", autopair=True)
+            return lockdown, "USB"
+
+    # Wi-Fi 链路：1. usbmux Network -> 2. Bonjour (dns-sd / mobdev2) -> 3. 手动 IP TCP
+    last_wifi_error: Exception | None = None
+    for dev in matching_mux(False):
+        try:
+            lockdown = await _connect_usbmux_device(pmd3, dev.serial, "Network", autopair=False)
+            return lockdown, "Wi-Fi (usbmux)"
+        except Exception as exc:
+            last_wifi_error = exc
+
+    bonjour_conns = await _discover_bonjour_lockdowns(pmd3, target_udid=want_udid, timeout=2.5)
+    if bonjour_conns:
+        chosen_ip, chosen_lockdown = bonjour_conns[0]
+        for _, extra in bonjour_conns[1:]:
+            await _safe_close_lockdown(extra)
+        return chosen_lockdown, f"Wi-Fi (Bonjour {chosen_ip})"
+
+    if host:
+        try:
+            lockdown = await _connect_tcp_lockdown(pmd3, host, target_udid=want_udid)
+            return lockdown, f"Wi-Fi (TCP {host})"
+        except Exception as exc:
+            last_wifi_error = exc
+
+    # 若指定只优先 Wi-Fi 但 auto 模式下仅有 USB 可用，则退回 USB
+    if mode == CONNECTION_MODE_AUTO and prefer_transport == "wifi":
+        usb_devs = matching_mux(True)
+        if usb_devs:
+            lockdown = await _connect_usbmux_device(pmd3, usb_devs[0].serial, "USB", autopair=True)
+            return lockdown, "USB"
+
+    if last_wifi_error is not None:
+        if isinstance(last_wifi_error, AppError):
+            raise last_wifi_error
+        raise AppError(
+            f"Wi-Fi 连接尝试失败：{friendly_afc_connect_error(last_wifi_error)}\n"
+            "提示：请确认手机与电脑在同一局域网、手机已解锁，且已在“菜单 1 → 开启 Wi-Fi 同步”完成设置。"
+        ) from last_wifi_error
+
+    if mode == CONNECTION_MODE_WIFI:
+        raise AppError(
+            "没有通过 Wi-Fi 检测到可连接的已配对 iPhone。\n"
+            "请确认：\n"
+            "  1. iPhone 与电脑处于同一 Wi-Fi 局域网（未开启路由器 AP 隔离）\n"
+            "  2. 曾用 USB 连过一次并在“菜单 1 → 开启 Wi-Fi 同步”完成开启\n"
+            "  3. 若当前被路由器屏蔽了 mDNS 广播，可在菜单 1 设置 iPhone 的手动 Wi-Fi IP"
+        )
+    if mux_error is not None and not host:
+        raise AppError(friendly_afc_connect_error(mux_error)) from mux_error
+    raise AppError(
+        "没有检测到通过 USB 或 Wi-Fi 连接的 iPhone。\n"
+        "请插上 USB 数据线，或确认已在菜单 1 开启 Wi-Fi 同步且手机与电脑处于同一局域网。"
+    )
+
+
+async def _enable_wifi_sync_coro(pmd3: SimpleNamespace, target_udid: str = "") -> dict[str, Any]:
+    """通过 USB 连接一次，完成信任配对、开启 EnableWifiConnections 并缓存配对记录。"""
+    try:
+        usb_devs = [d for d in await pmd3.usbmux.list_devices() if d.is_usb]
+    except Exception as exc:
+        raise AppError(friendly_afc_connect_error(exc)) from exc
+    if target_udid:
+        matched = [d for d in usb_devs if _normalize_udid(d.serial) == _normalize_udid(target_udid)]
+        if matched:
+            usb_devs = matched
+    if not usb_devs:
+        raise AppError("请先用 USB 数据线连接 iPhone 并解锁屏幕，再执行此操作。")
+
+    lockdown = await pmd3.create_using_usbmux(
+        serial=usb_devs[0].serial,
+        connection_type="USB",
+        autopair=True,
+    )
+    try:
+        if not lockdown.paired:
+            await lockdown.pair()
+        already_enabled = False
+        try:
+            already_enabled = await lockdown.get_enable_wifi_connections()
+        except Exception:
+            already_enabled = False
+        if not already_enabled:
+            await lockdown.set_enable_wifi_connections(True)
+        enabled_now = await lockdown.get_enable_wifi_connections()
+
+        # 确保 ~/.pymobiledevice3/<UDID>.plist 也有配对记录，便于无 usbmuxd 时 Bonjour/TCP 使用
+        cached_local = False
+        if lockdown.pair_record and lockdown.udid:
+            cache_dir = pmd3.get_home_folder()
+            cache_file = cache_dir / f"{lockdown.udid}.plist"
+            if not cache_file.exists():
+                cache_file.write_bytes(plistlib.dumps(lockdown.pair_record))
+                cached_local = True
+
+        values = lockdown.all_values or {}
+        return {
+            "name": values.get("DeviceName") or "iPhone",
+            "version": values.get("ProductVersion") or "?",
+            "udid": _normalize_udid(lockdown.udid or usb_devs[0].serial),
+            "already_enabled": already_enabled,
+            "enabled_now": enabled_now,
+            "cached_local": cached_local,
+        }
+    finally:
+        await _safe_close_lockdown(lockdown)
+
+
+def inspect_devices(wifi_host: str = "") -> tuple[list[DiscoveredEndpoint], str | None]:
+    pmd3 = _import_pmd3()
+    return asyncio.run(_discover_all_endpoints_coro(pmd3, wifi_host=wifi_host))
+
+
+def enable_wifi_sync_over_usb(target_udid: str = "") -> dict[str, Any]:
+    pmd3 = _import_pmd3()
+    return asyncio.run(_enable_wifi_sync_coro(pmd3, target_udid=target_udid))
+
+
 class AFCMediaSourceBase:
     """AFC 媒体源公共逻辑：主文件 + 可选附属文件（.AAE 编辑记录 / Live Photo .MOV）。"""
+
+    transport_label: str = "AFC"
 
     def __init__(self) -> None:
         self.directory_cache: dict[str, set[str] | None] = {}
@@ -354,15 +1076,23 @@ class AFCMediaSourceBase:
 class AFCMediaSource(AFCMediaSourceBase):
     """命令行兜底方案：每个文件调用一次 `pymobiledevice3 afc` 子进程（较慢）。"""
 
-    def __init__(self, exe: str) -> None:
+    def __init__(self, exe: str, use_mobdev2: bool = False) -> None:
         super().__init__()
         self.exe = exe
+        self.use_mobdev2 = use_mobdev2
+        self.transport_label = "Wi-Fi (命令行)" if use_mobdev2 else "USB/usbmux (命令行)"
+
+    def _cmd(self, *args: str) -> list[str]:
+        base = [self.exe, "afc", *args]
+        if self.use_mobdev2:
+            base.append("--mobdev2")
+        return base
 
     def _list_directory(self, remote_dir: str) -> set[str] | None:
         if remote_dir in self.directory_cache:
             return self.directory_cache[remote_dir]
         result = subprocess.run(
-            [self.exe, "afc", "ls", remote_dir],
+            self._cmd("ls", remote_dir),
             text=True,
             capture_output=True,
         )
@@ -378,7 +1108,7 @@ class AFCMediaSource(AFCMediaSourceBase):
         return names
 
     def pull_file(self, remote: str, dest_path: Path) -> tuple[str, int]:
-        code = run_streaming([self.exe, "afc", "pull", "-i", remote, str(dest_path)])
+        code = run_streaming(self._cmd("pull", "-i", remote, str(dest_path)))
         if code != 0 or not dest_path.exists():
             if dest_path.exists():
                 dest_path.unlink()
@@ -387,52 +1117,165 @@ class AFCMediaSource(AFCMediaSourceBase):
 
 
 class AFCServiceSource(AFCMediaSourceBase):
-    """进程内 AFC 媒体源（v1.0 首选）。
+    """进程内 AFC 媒体源（支持 USB 与 Wi-Fi）。
 
-    在后台线程里维护一个 asyncio 事件循环和一条 AfcService USB 连接；
+    在后台线程里维护一个 asyncio 事件循环和一条 AfcService 连接；
     同步接口通过 run_coroutine_threadsafe 提交任务。拉取文件时用
     fopen/fread 流式读取，边写盘边计算 sha256，避免二次读盘。
+    Wi-Fi 瞬断时支持自动重连并重试一次当前文件。
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        connection_mode: str = CONNECTION_MODE_AUTO,
+        wifi_host: str = "",
+        target_udid: str = "",
+        prefer_transport: str = "",
+        preferred_host: str = "",
+    ) -> None:
         super().__init__()
-        pmd3 = _import_pmd3()
-        self._pmd3_exceptions = pmd3.exceptions
+        self.connection_mode = connection_mode
+        self.wifi_host = wifi_host
+        self.target_udid = _normalize_udid(target_udid)
+        self.prefer_transport = prefer_transport
+        self.preferred_host = preferred_host
+        self._pmd3 = _import_pmd3()
+        self._pmd3_exceptions = self._pmd3.exceptions
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._loop.run_forever, name="afc-event-loop", daemon=True)
         self._thread.start()
+        self._lockdown: Any = None
+        self._hb_task: asyncio.Task[None] | None = None
         self._afc: Any = None
-        future = asyncio.run_coroutine_threadsafe(self._open(pmd3), self._loop)
+        self.transport_label = "AFC"
         try:
-            self._afc = future.result(timeout=180)
+            future = asyncio.run_coroutine_threadsafe(self._open(), self._loop)
+            future.result(timeout=180)
         except concurrent.futures.TimeoutError as exc:
-            raise AppError("连接 iPhone 超时（超过 3 分钟）。请解锁手机、点“信任此电脑”后重试。") from exc
+            self.close()
+            raise AppError("连接 iPhone 超时（超过 3 分钟）。请解锁手机、确认网络连接后重试。") from exc
+        except AppError:
+            self.close()
+            raise
+        except Exception as exc:
+            self.close()
+            raise AppError(friendly_afc_connect_error(exc)) from exc
+
+    async def _open(self) -> None:
+        try:
+            lockdown, transport_label = await _open_lockdown(
+                self._pmd3,
+                connection_mode=self.connection_mode,
+                wifi_host=self.wifi_host,
+                target_udid=self.target_udid,
+                prefer_transport=self.prefer_transport,
+                preferred_host=self.preferred_host,
+            )
         except AppError:
             raise
         except Exception as exc:
             raise AppError(friendly_afc_connect_error(exc)) from exc
 
-    async def _open(self, pmd3: SimpleNamespace) -> Any:
+        hb_task: asyncio.Task[None] | None = None
+        if isinstance(lockdown, self._pmd3.TcpLockdownClient):
+            ready = asyncio.Event()
+            hb_task = asyncio.create_task(_run_heartbeat(lockdown, ready), name="lockdown-heartbeat")
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=10.0)
+            except Exception:
+                hb_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await hb_task
+                hb_task = None
+
+        afc = self._pmd3.AfcService(lockdown=lockdown)
         try:
-            lockdown = await pmd3.create_using_usbmux()
-        except Exception as exc:
-            raise AppError(friendly_afc_connect_error(exc)) from exc
-        afc = pmd3.AfcService(lockdown=lockdown)
-        await afc.__aenter__()
-        return afc
+            await afc.__aenter__()
+        except Exception:
+            if hb_task is not None:
+                hb_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await hb_task
+            await _safe_close_lockdown(lockdown)
+            raise
+        self._lockdown = lockdown
+        self._hb_task = hb_task
+        self._afc = afc
+        self.transport_label = transport_label
+        if not self.target_udid:
+            self.target_udid = _normalize_udid(getattr(lockdown, "udid", None))
+
+    async def _close_clients_coro(self) -> None:
+        if self._afc is not None:
+            try:
+                await self._afc.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._afc = None
+        if self._hb_task is not None:
+            self._hb_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._hb_task
+            self._hb_task = None
+        if self._lockdown is not None:
+            await _safe_close_lockdown(self._lockdown)
+            self._lockdown = None
+
+    async def _reconnect_coro(self) -> None:
+        await self._close_clients_coro()
+        await self._open()
 
     def _call(self, coro: Any, timeout: float | None = None) -> Any:
         return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout)
 
+    def _is_connection_error(self, exc: Exception) -> bool:
+        excs = self._pmd3_exceptions
+        if isinstance(exc, excs.AfcException):
+            return False
+        conn_types = [
+            ConnectionError,
+            TimeoutError,
+            asyncio.TimeoutError,
+            asyncio.IncompleteReadError,
+            EOFError,
+            excs.ConnectionTerminatedError,
+            excs.ConnectionFailedError,
+            excs.MuxException,
+        ]
+        for attr in ("ChannelClosedError", "StreamClosedError"):
+            cls = getattr(excs, attr, None)
+            if cls is not None:
+                conn_types.append(cls)
+        return isinstance(exc, tuple(conn_types))
+
+    def reconnect(self) -> None:
+        try:
+            self._call(self._reconnect_coro(), timeout=60)
+        except AppError as exc:
+            raise ConnectionLostError(f"连接已断开且重连失败：{exc}") from exc
+        except Exception as exc:
+            raise ConnectionLostError(f"连接已断开且重连失败：{friendly_afc_connect_error(exc)}") from exc
+
     def _list_directory(self, remote_dir: str) -> set[str] | None:
         if remote_dir in self.directory_cache:
             return self.directory_cache[remote_dir]
-        try:
-            names = set(self._call(self._afc.listdir(remote_dir), timeout=60))
-        except Exception:
-            names = None
-        self.directory_cache[remote_dir] = names
-        return names
+        for attempt in range(2):
+            try:
+                names = set(self._call(self._afc.listdir(remote_dir), timeout=60))
+                self.directory_cache[remote_dir] = names
+                return names
+            except self._pmd3_exceptions.AfcException:
+                self.directory_cache[remote_dir] = None
+                return None
+            except Exception as exc:
+                if attempt == 0 and self._is_connection_error(exc):
+                    try:
+                        self.reconnect()
+                        continue
+                    except ConnectionLostError:
+                        return None
+                return None
+        return None
 
     async def _pull_file_coro(self, remote: str, dest_path: Path) -> tuple[str, int]:
         afc = self._afc
@@ -467,7 +1310,10 @@ class AFCServiceSource(AFCMediaSourceBase):
                                 flush=True,
                             )
             finally:
-                await afc.fclose(handle)
+                try:
+                    await afc.fclose(handle)
+                except Exception:
+                    pass
         elapsed = time.monotonic() - start
         speed = size / elapsed if elapsed > 0 else 0.0
         summary = f"{human_size(size)}  {elapsed:.1f}s  {human_size(speed)}/s"
@@ -481,83 +1327,104 @@ class AFCServiceSource(AFCMediaSourceBase):
         return hasher.hexdigest(), size
 
     def pull_file(self, remote: str, dest_path: Path) -> tuple[str, int]:
-        try:
-            return self._call(self._pull_file_coro(remote, dest_path))
-        except self._pmd3_exceptions.AfcException as exc:
-            with PRINT_LOCK:
-                print()  # 收掉可能停留在半行的进度行
-            if dest_path.exists():
-                dest_path.unlink()
-            raise AppError(f"AFC 拉取失败：{remote}（{exc}）") from exc
+        for attempt in range(2):
+            try:
+                return self._call(self._pull_file_coro(remote, dest_path))
+            except self._pmd3_exceptions.AfcException as exc:
+                with PRINT_LOCK:
+                    print()  # 收掉可能停留在半行的进度行
+                if dest_path.exists():
+                    dest_path.unlink()
+                raise AppError(f"AFC 拉取失败：{remote}（{exc}）") from exc
+            except Exception as exc:
+                with PRINT_LOCK:
+                    print()
+                if dest_path.exists():
+                    dest_path.unlink()
+                if self._is_connection_error(exc):
+                    if attempt == 0:
+                        print(f"提示：连接波动（{type(exc).__name__}），正在自动重连并重试 {Path(remote).name}……")
+                        self.reconnect()
+                        continue
+                    raise ConnectionLostError(
+                        f"与 iPhone 的连接中断（{type(exc).__name__}: {exc}）。请确认设备仍连接后再试。"
+                    ) from exc
+                raise
+        raise ConnectionLostError(f"与 iPhone 的连接中断，无法拉取 {remote}。")
 
     def close(self) -> None:
-        if getattr(self, "_afc", None) is not None:
+        if getattr(self, "_loop", None) is not None and self._loop.is_running():
             try:
-                self._call(self._afc.__aexit__(None, None, None), timeout=30)
+                self._call(self._close_clients_coro(), timeout=30)
             except Exception:
                 pass
-            self._afc = None
-        if getattr(self, "_loop", None) is not None and self._loop.is_running():
             self._loop.call_soon_threadsafe(self._loop.stop)
             self._thread.join(timeout=5)
             self._loop.close()
+        elif getattr(self, "_loop", None) is not None and not self._loop.is_closed():
+            self._loop.close()
 
 
-def make_afc_media_source() -> AFCMediaSourceBase:
+def make_afc_media_source(
+    connection_mode: str = CONNECTION_MODE_AUTO,
+    wifi_host: str = "",
+    target_udid: str = "",
+    prefer_transport: str = "",
+    preferred_host: str = "",
+) -> AFCMediaSourceBase:
     try:
         _import_pmd3()
     except ImportError:
         exe = find_pymobiledevice3()
         if exe:
             print("提示：pymobiledevice3 Python 库导入失败，改用命令行方式（每个文件会重启子进程，较慢）。")
-            return AFCMediaSource(exe)
+            return AFCMediaSource(exe, use_mobdev2=(connection_mode == CONNECTION_MODE_WIFI))
         print_missing_pymobiledevice3()
         raise AppError("没有可用的 pymobiledevice3，无法通过 AFC 访问 iPhone。")
     try:
-        return AFCServiceSource()
+        return AFCServiceSource(
+            connection_mode=connection_mode,
+            wifi_host=wifi_host,
+            target_udid=target_udid,
+            prefer_transport=prefer_transport,
+            preferred_host=preferred_host,
+        )
     except AppError:
         raise
     except Exception as exc:
         raise AppError(friendly_afc_connect_error(exc)) from exc
 
 
-def refresh_photos_metadata(metadata_root: Path) -> Path:
-    """从手机拉取 Photos.sqlite 到 metadata_root 下的单个工作文件（覆盖旧副本）。
+def refresh_photos_metadata(
+    metadata_root: Path,
+    media_source: AFCMediaSourceBase,
+) -> Path:
+    """使用现有 AFC 连接从手机拉取 Photos.sqlite 到 metadata_root 下的单个工作文件（覆盖旧副本）。
 
     相簿结构数据库只是临时工作数据：相簿一变它就过时了，所以不再按时间戳
     留存多份快照，每次刷新直接覆盖。主文件先拉到 .part 再原子替换，
     避免中途断开留下截断的数据库。
     """
-    media_source = make_afc_media_source()
+    metadata_root.mkdir(parents=True, exist_ok=True)
+    main_path = metadata_root / "Photos.sqlite"
+    part_path = metadata_root / "Photos.sqlite.part"
+    for stale in (metadata_root / "Photos.sqlite-wal", metadata_root / "Photos.sqlite-shm"):
+        if stale.exists():
+            stale.unlink()
     try:
-        metadata_root.mkdir(parents=True, exist_ok=True)
-        main_path = metadata_root / "Photos.sqlite"
-        part_path = metadata_root / "Photos.sqlite.part"
-        for stale in (metadata_root / "Photos.sqlite-wal", metadata_root / "Photos.sqlite-shm"):
-            if stale.exists():
-                stale.unlink()
+        media_source.pull_file("PhotoData/Photos.sqlite", part_path)
+    except AppError:
+        if part_path.exists():
+            part_path.unlink()
+        raise AppError("没有成功读取 PhotoData/Photos.sqlite。请确认手机已解锁并信任此电脑。")
+    os.replace(part_path, main_path)
+    for suffix in ("-wal", "-shm"):
         try:
-            media_source.pull_file("PhotoData/Photos.sqlite", part_path)
+            media_source.pull_file(f"PhotoData/Photos.sqlite{suffix}", metadata_root / f"Photos.sqlite{suffix}")
         except AppError:
-            if part_path.exists():
-                part_path.unlink()
-            raise AppError("没有成功读取 PhotoData/Photos.sqlite。请确认手机已解锁并信任此电脑。")
-        os.replace(part_path, main_path)
-        for suffix in ("-wal", "-shm"):
-            try:
-                media_source.pull_file(f"PhotoData/Photos.sqlite{suffix}", metadata_root / f"Photos.sqlite{suffix}")
-            except AppError:
-                print(f"提示：Photos.sqlite{suffix} 没有拉取到（只可能缺少最近一次改动，不影响使用）。")
-        print(f"\n相簿元数据已更新：{main_path}")
-        return metadata_root
-    finally:
-        media_source.close()
-
-
-# ============================================================================
-# 备用方案：含媒体逻辑备份（backup2）已于 v1.1 移除。
-# AFC 直连导出覆盖全部日常场景，完整备份请使用 iTunes/访达 或 iCloud。
-# ============================================================================
+            print(f"提示：Photos.sqlite{suffix} 没有拉取到（只可能缺少最近一次改动，不影响使用）。")
+    print(f"\n相簿元数据已更新：{main_path}")
+    return metadata_root
 
 
 class PhotosParser:
@@ -1134,30 +2001,49 @@ def load_library_from_metadata(metadata_root: Path) -> PhotosLibrary:
         parser.close()
 
 
-def load_metadata_source(metadata_root: Path) -> tuple[AFCMediaSourceBase, PhotosLibrary]:
-    """加载相簿元数据并准备 AFC 媒体源（菜单 2 共用）。"""
-    media_source = make_afc_media_source()
-    library = load_library_from_metadata(metadata_root)
-    print_library_summary(library, metadata_root, media_source)
-    return media_source, library
+def refresh_and_load_metadata(
+    metadata_root: Path,
+    connection_mode: str = CONNECTION_MODE_AUTO,
+    wifi_host: str = "",
+    selected_device: dict[str, Any] | None = None,
+) -> tuple[AFCMediaSourceBase, PhotosLibrary, dict[str, Any] | None]:
+    """选择目标设备并建立一次 AFC 连接，拉取最新 Photos.sqlite 与相簿结构（菜单 2 使用）。"""
+    chosen, updated_selected = choose_endpoint_for_connect(
+        connection_mode=connection_mode,
+        wifi_host=wifi_host,
+        selected_device=selected_device,
+    )
+    media_source = make_afc_media_source(
+        connection_mode=connection_mode,
+        wifi_host=wifi_host,
+        target_udid=chosen.udid if chosen else "",
+        prefer_transport=("usb" if chosen.is_usb else "wifi") if chosen else "",
+        preferred_host=(chosen.host or "") if chosen else "",
+    )
+    try:
+        refresh_photos_metadata(metadata_root, media_source)
+        library = load_library_from_metadata(metadata_root)
+        print_library_summary(library, media_source)
+        return media_source, library, updated_selected
+    except Exception:
+        media_source.close()
+        raise
 
 
 def print_library_summary(
     library: PhotosLibrary,
-    source_path: Path,
     media_source: AFCMediaSourceBase | None = None,
 ) -> None:
-    print("\n已加载来源：", source_path)
-    print("Photos 数据库：", library.db_path)
+    print("\nPhotos 数据库：", library.db_path)
     print(f"资产表：{library.asset_table}")
     print(f"相簿表：{library.album_table or '未识别'}")
     print(f"相簿关系表：{library.join_table or '未识别'}")
     print(f"资产数量：{len(library.assets)}")
     print(f"可选分类/相簿：{len(library.albums)}")
     if isinstance(media_source, AFCServiceSource):
-        print("导出方式：进程内 AFC 直连（快）")
+        print(f"导出方式：进程内 AFC 直连（{media_source.transport_label}，快）")
     elif isinstance(media_source, AFCMediaSource):
-        print("导出方式：命令行 AFC 直连（慢，建议 pip 安装 pymobiledevice3 后重试）")
+        print(f"导出方式：命令行 AFC 直连（{media_source.transport_label}，慢，建议 pip 安装 pymobiledevice3 后重试）")
 
 
 def list_albums(library: PhotosLibrary) -> None:
@@ -1451,12 +2337,6 @@ def export_selected_albums(
                         continue
                     done += 1
                     media_records = media_source.find_media_for_asset(asset)
-                    if not media_records:
-                        missing += 1
-                        log_writer.write(
-                            log_entry(run_id, album, asset, None, "", "missing", "备份里没有找到媒体文件")
-                        )
-                        continue
                     for record in media_records:
                         source_key = f"{asset.source_key}|{media_identity(record)}"
                         previous_album = exported_in_album.get(source_key)
@@ -1500,6 +2380,8 @@ def export_selected_albums(
                         try:
                             dest_dir.mkdir(parents=True, exist_ok=True)
                             sha256, size = export_media_record(media_source, record, dest_path)
+                        except ConnectionLostError:
+                            raise
                         except AppError as exc:
                             handle_export_failure(record, str(exc))
                             continue
@@ -1547,6 +2429,10 @@ def export_selected_albums(
                                 f"  已处理 {done}/{total}：复制 {copied}，重复 {duplicate_copied}，"
                                 f"跳过 {skipped}，缺失 {missing}"
                             )
+        except ConnectionLostError as exc:
+            interrupted = True
+            print(f"\n\n连接中断：{exc}")
+            print("已完成的部分仍记录在本次 CSV 与索引库里，恢复连接后重跑即可继续。")
         except KeyboardInterrupt:
             interrupted = True
             print("\n\n已中断：已完成的部分仍记录在本次 CSV 里。")
@@ -1592,7 +2478,7 @@ def make_delete_review(
     export_root: Path,
 ) -> None:
     print("\n说明：这个功能不会删除 iPhone 上的原件。")
-    print("原因是 iOS 没有通过 USB 暴露“按 Photos 相簿安全删除”的公开接口；直接删 AFC/DCIM 文件会让照片库数据库失配。")
+    print("原因是 iOS 没有通过 USB/Wi-Fi 暴露“按 Photos 相簿安全删除”的公开接口；直接删 AFC/DCIM 文件会让照片库数据库失配。")
     print("这里生成一份清单，方便你在手机 Photos App 内核对后手动删除。")
     list_albums(library)
     value = prompt("\n输入要生成清单的相簿编号，例如 1,3-5")
@@ -1616,7 +2502,7 @@ def make_delete_review(
                     "filename": asset.filename,
                     "created": apple_time_to_iso(asset.date_created),
                     "phone_library_path": f"{asset.directory}/{asset.filename}",
-                    "backup_sources": "; ".join(record.key for record in records),
+                    "afc_paths": "; ".join(record.key for record in records),
                     "note": "请在 iPhone 照片 App 内手动确认并删除",
                 }
             )
@@ -1630,7 +2516,7 @@ def make_delete_review(
                 "filename",
                 "created",
                 "phone_library_path",
-                "backup_sources",
+                "afc_paths",
                 "note",
             ],
         )
@@ -1681,24 +2567,340 @@ def load_config() -> dict[str, Any]:
             "export_root": str(DEFAULT_EXPORT_ROOT),
             "metadata_root": str(DEFAULT_METADATA_ROOT),
             "index_path": str(DEFAULT_INDEX_PATH),
+            "connection_mode": CONNECTION_MODE_AUTO,
+            "wifi_host": "",
         },
     )
+    # 清理早期版本遗留的完整备份配置键（如 backup_root）
+    removed_legacy = False
+    for legacy_key in ("backup_root",):
+        if legacy_key in config:
+            config.pop(legacy_key, None)
+            removed_legacy = True
     config.setdefault("export_root", str(DEFAULT_EXPORT_ROOT))
     config.setdefault("metadata_root", str(DEFAULT_METADATA_ROOT))
     config.setdefault("index_path", str(DEFAULT_INDEX_PATH))
+    if config.get("connection_mode") not in VALID_CONNECTION_MODES:
+        config["connection_mode"] = CONNECTION_MODE_AUTO
+    config["wifi_host"] = str(config.get("wifi_host") or "").strip()
+    if removed_legacy and CONFIG_PATH.exists():
+        save_json(CONFIG_PATH, config)
     return config
+
+
+def _format_endpoint_line(
+    ep: DiscoveredEndpoint,
+    index: int | None = None,
+    selected_device: dict[str, Any] | None = None,
+) -> str:
+    prefix = f"  {index}. " if index is not None else "  - "
+    is_selected = False
+    if selected_device and ep.udid and _normalize_udid(selected_device.get("udid")) == ep.udid:
+        pref = selected_device.get("prefer_transport")
+        if not pref or (pref == "usb" and ep.is_usb) or (pref == "wifi" and ep.is_wifi):
+            is_selected = True
+    tag = " [当前已选]" if is_selected else ""
+    if ep.error:
+        return f"{prefix}[{ep.transport_label}] {ep.name} | 异常：{ep.error}{tag}"
+    paired_text = "已配对" if ep.paired else "未配对"
+    wifi_state = ep.wifi_enabled
+    wifi_text = "已开启" if wifi_state is True else ("未开启" if wifi_state is False else "未知")
+    return (
+        f"{prefix}[{ep.transport_label}] {ep.name} (iOS {ep.version}) | "
+        f"{paired_text} | Wi-Fi同步：{wifi_text}{tag}"
+    )
+
+
+def _endpoint_to_selection(ep: DiscoveredEndpoint) -> dict[str, Any]:
+    return {
+        "udid": ep.udid,
+        "name": ep.name,
+        "prefer_transport": "usb" if ep.is_usb else "wifi",
+        "transport_label": ep.transport_label,
+        "host": ep.host or "",
+    }
+
+
+def _filter_endpoints_for_mode(
+    endpoints: list[DiscoveredEndpoint],
+    connection_mode: str,
+) -> list[DiscoveredEndpoint]:
+    paired = [ep for ep in endpoints if ep.paired and not ep.error]
+    if connection_mode == CONNECTION_MODE_USB:
+        return [ep for ep in paired if ep.is_usb]
+    if connection_mode == CONNECTION_MODE_WIFI:
+        return [ep for ep in paired if ep.is_wifi]
+    if connection_mode == CONNECTION_MODE_TCP:
+        return [ep for ep in paired if ep.transport_kind == "wifi-tcp"]
+    return paired
+
+
+def choose_endpoint_for_connect(
+    connection_mode: str,
+    wifi_host: str,
+    selected_device: dict[str, Any] | None = None,
+) -> tuple[DiscoveredEndpoint | None, dict[str, Any] | None]:
+    """按配置模式与已选设备确定目标端点；发现多个可用设备时提示用户选择。"""
+    try:
+        _import_pmd3()
+    except ImportError:
+        return None, selected_device
+
+    if connection_mode == CONNECTION_MODE_TCP and not (wifi_host or "").strip():
+        return None, selected_device
+
+    endpoints, _ = inspect_devices(wifi_host=wifi_host)
+    candidates = _filter_endpoints_for_mode(endpoints, connection_mode)
+    if not candidates:
+        return None, selected_device
+
+    if selected_device and selected_device.get("udid"):
+        want_udid = _normalize_udid(selected_device["udid"])
+        pref = selected_device.get("prefer_transport")
+        by_udid = [ep for ep in candidates if ep.udid == want_udid]
+        if by_udid:
+            if pref == "usb":
+                exact = next((ep for ep in by_udid if ep.is_usb), None)
+                if exact:
+                    return exact, selected_device
+            elif pref == "wifi":
+                exact = next((ep for ep in by_udid if ep.is_wifi), None)
+                if exact:
+                    return exact, selected_device
+            return by_udid[0], selected_device
+
+        print(f"\n提示：已指定的设备「{selected_device.get('name', 'iPhone')}」当前不可达，以下设备可用：")
+        for idx, ep in enumerate(candidates, start=1):
+            print(_format_endpoint_line(ep, index=idx))
+        raw = prompt("输入要改连的设备编号（回车取消）")
+        if not raw:
+            raise AppError("已取消连接。")
+        try:
+            idx = int(raw)
+        except ValueError as exc:
+            raise AppError("无效的设备编号。") from exc
+        if not (1 <= idx <= len(candidates)):
+            raise AppError("设备编号超出范围。")
+        chosen = candidates[idx - 1]
+        return chosen, _endpoint_to_selection(chosen)
+
+    # 未手动指定设备：auto 模式下若同一设备同时在线 USB 与 Wi-Fi，优先保留 USB 避免重复询问
+    if connection_mode == CONNECTION_MODE_AUTO:
+        deduped: list[DiscoveredEndpoint] = []
+        seen_udids: dict[str, int] = {}
+        for ep in candidates:
+            if ep.udid and ep.udid in seen_udids:
+                prev_idx = seen_udids[ep.udid]
+                if ep.is_usb and not deduped[prev_idx].is_usb:
+                    deduped[prev_idx] = ep
+                continue
+            if ep.udid:
+                seen_udids[ep.udid] = len(deduped)
+            deduped.append(ep)
+        candidates = deduped
+
+    if len(candidates) == 1:
+        return candidates[0], selected_device
+
+    print("\n检测到多个可用设备，请选择要连接的设备：")
+    for idx, ep in enumerate(candidates, start=1):
+        print(_format_endpoint_line(ep, index=idx))
+    raw = prompt("输入设备编号", "1")
+    try:
+        idx = int(raw)
+    except ValueError as exc:
+        raise AppError("无效的设备编号。") from exc
+    if not (1 <= idx <= len(candidates)):
+        raise AppError("设备编号超出范围。")
+    chosen = candidates[idx - 1]
+    return chosen, _endpoint_to_selection(chosen)
+
+
+def _choose_connection_mode(config: dict[str, Any]) -> bool:
+    print("\n选择连接方式：")
+    print("1. 自动（USB 优先，未插线自动走 Wi-Fi）[推荐]")
+    print("2. 仅 Wi-Fi 无线连接（忽略 USB 线，强制无线）")
+    print("3. 仅 USB 有线连接")
+    print("4. 手动 Wi-Fi IP 直连（TCP 62078，mDNS 广播受阻时使用）")
+    mapping = {
+        "1": CONNECTION_MODE_AUTO,
+        "2": CONNECTION_MODE_WIFI,
+        "3": CONNECTION_MODE_USB,
+        "4": CONNECTION_MODE_TCP,
+    }
+    current_choice = next((k for k, v in mapping.items() if v == config["connection_mode"]), "1")
+    selected = prompt("选择", current_choice)
+    new_mode = mapping.get(selected)
+    if not new_mode:
+        print("无效选择，未修改。")
+        return False
+    if new_mode == CONNECTION_MODE_TCP and not config.get("wifi_host"):
+        ip = prompt("输入 iPhone 局域网 IP（可在 iPhone 设置→无线局域网→i 图标查看）")
+        if ip:
+            config["wifi_host"] = ip.strip()
+        else:
+            print("未输入 IP，取消切换为手动直连。")
+            return False
+    if new_mode != config["connection_mode"]:
+        config["connection_mode"] = new_mode
+        save_json(CONFIG_PATH, config)
+        print(f"已切换为：{CONNECTION_MODE_LABELS[new_mode]}")
+        return True
+    save_json(CONFIG_PATH, config)
+    print("保持当前连接方式。")
+    return False
+
+
+def connection_menu(
+    config: dict[str, Any],
+    selected_device: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
+    """菜单 1：探测 USB / Wi-Fi 设备、选择目标设备、开启 Wi-Fi 同步、切换连接模式。"""
+    changed = False
+    while True:
+        mode = config["connection_mode"]
+        wifi_host = config["wifi_host"]
+        print("\n" + "-" * 64)
+        print("连接管理（USB / Wi-Fi 无线同步 / 设备选择）")
+        print("-" * 64)
+        print(f"默认连接方式：{CONNECTION_MODE_LABELS.get(mode, mode)}")
+        if selected_device:
+            print(f"当前指定设备：{selected_device['name']} [{selected_device['transport_label']}]")
+        else:
+            print("当前指定设备：自动选择（仅 1 台设备时直连，多台时提示选择）")
+        print(f"手动 Wi-Fi IP：{wifi_host or '未设置（自动通过 usbmux/Bonjour 发现）'}")
+        print("\n正在探测可用设备（USB / Wi-Fi）……")
+        endpoints: list[DiscoveredEndpoint] = []
+        try:
+            endpoints, mux_error = inspect_devices(wifi_host=wifi_host)
+            if mux_error:
+                print(f"提示：usbmuxd 暂不可用（{mux_error}），已通过 Bonjour/TCP 探测。")
+            print("\n发现的设备端点：")
+            if endpoints:
+                for idx, ep in enumerate(endpoints, start=1):
+                    print(_format_endpoint_line(ep, index=idx, selected_device=selected_device))
+            else:
+                print("  （暂未检测到任何 USB 或 Wi-Fi 设备）")
+        except ImportError:
+            print_missing_pymobiledevice3()
+        except Exception as exc:
+            print(f"探测失败：{exc}")
+
+        print("\n操作：")
+        print("1. 选择要连接的设备（多设备或指定 USB / Wi-Fi）")
+        print("2. 开启 iPhone Wi-Fi 同步（首次需先插一次 USB 线）")
+        print("3. 切换默认连接方式（自动 / 仅 Wi-Fi / 仅 USB / 手动 IP）")
+        print("4. 设置或清除手动 Wi-Fi IP")
+        print("5. 重新扫描设备")
+        print("回车. 返回主菜单")
+        action = prompt("选择")
+        if not action:
+            break
+        if action == "1":
+            selectable = [ep for ep in endpoints if ep.paired and not ep.error]
+            if not selectable:
+                print("当前没有可选择的已配对设备。请先插上 USB 线信任电脑，或检查 Wi-Fi。")
+                press_enter()
+                continue
+            print("\n可选设备（输入 0 恢复自动选择）：")
+            for idx, ep in enumerate(selectable, start=1):
+                print(_format_endpoint_line(ep, index=idx, selected_device=selected_device))
+            raw = prompt("输入编号（0 恢复自动，回车取消）")
+            if not raw:
+                continue
+            if raw == "0":
+                if selected_device is not None:
+                    selected_device = None
+                    changed = True
+                print("已恢复自动选择设备。")
+            else:
+                try:
+                    idx = int(raw)
+                except ValueError:
+                    print("无效编号。")
+                    press_enter()
+                    continue
+                if 1 <= idx <= len(selectable):
+                    chosen = selectable[idx - 1]
+                    selected_device = _endpoint_to_selection(chosen)
+                    changed = True
+                    print(f"已选定设备：{chosen.name} [{chosen.transport_label}]（本次会话有效）。")
+                else:
+                    print("编号超出范围。")
+            press_enter()
+        elif action == "2":
+            usb_eps = [ep for ep in endpoints if ep.is_usb and not ep.error]
+            target_udid = ""
+            if len(usb_eps) > 1:
+                print("\n检测到多台 USB 设备，请选择要开启 Wi-Fi 同步的设备：")
+                for idx, ep in enumerate(usb_eps, start=1):
+                    print(_format_endpoint_line(ep, index=idx))
+                raw = prompt("输入编号", "1")
+                try:
+                    idx = int(raw)
+                    if 1 <= idx <= len(usb_eps):
+                        target_udid = usb_eps[idx - 1].udid
+                except ValueError:
+                    pass
+            result = enable_wifi_sync_over_usb(target_udid=target_udid)
+            status = "已开启" if result["enabled_now"] else "未确认开启"
+            note = "（之前已开启）" if result["already_enabled"] else "（本次已打开开关）"
+            print(f"\n设备：{result['name']} (iOS {result['version']})")
+            print(f"Wi-Fi 同步状态：{status} {note}")
+            if result["cached_local"]:
+                print("已同步保存本机配对记录（无 iTunes 服务时也可直接 Bonjour/TCP 连接）。")
+            if result["enabled_now"]:
+                print("现在可以拔掉 USB 线，确保手机与电脑在同一 Wi-Fi 下，直接用菜单 2 或菜单 3 导出。")
+            press_enter()
+        elif action == "3":
+            if _choose_connection_mode(config):
+                changed = True
+            press_enter()
+        elif action == "4":
+            new_host = prompt("输入 iPhone 的局域网 IP（直接回车保持不变，输入 clear 清除）", wifi_host)
+            if new_host.lower() in {"clear", "none", "清除"}:
+                new_host = ""
+            if new_host != config["wifi_host"]:
+                config["wifi_host"] = new_host
+                save_json(CONFIG_PATH, config)
+                changed = True
+                print("已保存手动 Wi-Fi IP。" if new_host else "已清除手动 Wi-Fi IP。")
+            else:
+                print("没有修改。")
+            press_enter()
+        elif action == "5":
+            continue
+        else:
+            print("无效选择。")
+    return config, selected_device, changed
 
 
 def settings_menu(config: dict[str, Any]) -> dict[str, Any]:
     fields = [
         ("1", "export_root", "相簿导出目录"),
-        ("2", "metadata_root", "相簿元数据目录"),
+        ("2", "metadata_root", "相簿元数据缓存目录（Photos.sqlite 临时副本）"),
         ("3", "index_path", "导出索引数据库"),
     ]
     print("\n当前设置：")
     for number, key, label in fields:
         print(f"{number}. {label}：{config[key]}")
+    print(f"4. 连接方式：{CONNECTION_MODE_LABELS.get(config['connection_mode'], config['connection_mode'])}")
+    print(f"5. 手动 Wi-Fi IP：{config['wifi_host'] or '未设置'}")
     value = prompt("输入要修改的编号，或回车返回")
+    if value == "4":
+        _choose_connection_mode(config)
+        return config
+    if value == "5":
+        new_host = prompt("新的手动 Wi-Fi IP（输入 clear 清除）", config["wifi_host"])
+        if new_host.lower() in {"clear", "none", "清除"}:
+            new_host = ""
+        if new_host != config["wifi_host"]:
+            config["wifi_host"] = new_host
+            save_json(CONFIG_PATH, config)
+            print("已保存。")
+        else:
+            print("没有修改。")
+        return config
     for number, key, label in fields:
         if value != number:
             continue
@@ -1722,34 +2924,58 @@ def main() -> int:
     config = load_config()
     media_source: AFCMediaSourceBase | None = None
     library: PhotosLibrary | None = None
-    loaded_source_path: Path | None = None
-    loaded_source_kind = "未加载"
+    loaded_transport: str | None = None
+    selected_device: dict[str, Any] | None = None
 
     def drop_current() -> None:
-        nonlocal media_source, library
+        nonlocal media_source, library, loaded_transport
         if media_source is not None:
             media_source.close()
         media_source = None
         library = None
+        loaded_transport = None
+
+    def ensure_loaded(metadata_root: Path) -> tuple[AFCMediaSourceBase, PhotosLibrary]:
+        nonlocal media_source, library, loaded_transport, selected_device
+        if media_source is None or library is None:
+            drop_current()
+            media_source, library, selected_device = refresh_and_load_metadata(
+                metadata_root,
+                connection_mode=config["connection_mode"],
+                wifi_host=config["wifi_host"],
+                selected_device=selected_device,
+            )
+            loaded_transport = media_source.transport_label
+        return media_source, library
 
     try:
         while True:
             export_root = Path(config["export_root"]).expanduser()
             metadata_root = Path(config["metadata_root"]).expanduser()
             index_path = Path(config["index_path"]).expanduser()
+            mode_label = CONNECTION_MODE_LABELS.get(config["connection_mode"], config["connection_mode"])
+            device_label = (
+                f"{selected_device['name']} [{selected_device['transport_label']}]"
+                if selected_device
+                else "自动选择"
+            )
+            status_text = (
+                f"已连接 {loaded_transport}（已加载 {len(library.assets)} 项）"
+                if media_source is not None and library is not None and loaded_transport
+                else "未连接（选 2 加载或直接选 3 导出时自动连接）"
+            )
             print("\n" + "=" * 64)
             print(f"iOS 相簿备份管理 TUI  v{__version__}")
             print("=" * 64)
-            print(f"元数据目录：{metadata_root}")
+            print(f"连接方式：{mode_label} | 目标设备：{device_label}")
             print(f"导出目录：{export_root}")
-            print(f"当前来源：{loaded_source_kind} - {loaded_source_path or '未加载'}")
-            print("\n1. 检查 USB iPhone 连接")
-            print("2. 获取相簿元数据（从手机读取 Photos.sqlite）")
-            print("3. 查看相簿/分类")
-            print("4. 按相簿导出原始文件")
-            print("5. 查看导出记录/重复统计")
-            print("6. 生成待删除清单（不直接删除手机）")
-            print("7. 设置目录")
+            print(f"当前状态：{status_text}")
+            print("\n1. 连接管理与设备选择（USB / Wi-Fi 无线同步）")
+            print("2. 连接手机并加载相簿（读取 Photos.sqlite 并列出相簿）")
+            print("3. 按相簿导出原始文件")
+            print("4. 查看导出记录/重复统计")
+            print("5. 生成待删除清单（不直接删除手机）")
+            print("6. 设置目录与连接")
             print("0. 退出")
             try:
                 choice = prompt("选择")
@@ -1759,34 +2985,32 @@ def main() -> int:
 
             try:
                 if choice == "1":
-                    list_connected_devices()
-                    press_enter()
+                    config, selected_device, changed = connection_menu(config, selected_device)
+                    if changed and media_source is not None:
+                        drop_current()
+                        print("连接设置或目标设备已变更，已断开旧连接；下次操作将按新方式重连。")
                 elif choice == "2":
-                    refresh_photos_metadata(metadata_root)
                     drop_current()
-                    media_source, library = load_metadata_source(metadata_root)
-                    loaded_source_path = metadata_root
-                    loaded_source_kind = "相簿元数据（AFC直连）"
+                    _, lib = ensure_loaded(metadata_root)
+                    list_albums(lib)
                     press_enter()
                 elif choice == "3":
-                    require_library(library)
-                    list_albums(library)
+                    src, lib = ensure_loaded(metadata_root)
+                    export_selected_albums(src, lib, export_root, index_path)
                     press_enter()
                 elif choice == "4":
-                    require_library(library)
-                    require_media_source(media_source)
-                    export_selected_albums(media_source, library, export_root, index_path)
-                    press_enter()
-                elif choice == "5":
                     show_state_summary(index_path)
                     press_enter()
-                elif choice == "6":
-                    require_library(library)
-                    require_media_source(media_source)
-                    make_delete_review(media_source, library, export_root)
+                elif choice == "5":
+                    src, lib = ensure_loaded(metadata_root)
+                    make_delete_review(src, lib, export_root)
                     press_enter()
-                elif choice == "7":
+                elif choice == "6":
+                    prev_conn = (config["connection_mode"], config["wifi_host"])
                     config = settings_menu(config)
+                    if (config["connection_mode"], config["wifi_host"]) != prev_conn and media_source is not None:
+                        drop_current()
+                        print("连接设置已变更，已断开旧连接；下次操作将按新方式重连。")
                 elif choice == "0":
                     break
                 else:
@@ -1804,16 +3028,6 @@ def main() -> int:
         drop_current()
 
     return 0
-
-
-def require_library(library: PhotosLibrary | None) -> None:
-    if library is None:
-        raise AppError("请先获取或加载相簿元数据/备份。")
-
-
-def require_media_source(source: AFCMediaSourceBase | None) -> None:
-    if source is None:
-        raise AppError("请先执行菜单 2 获取相簿元数据。")
 
 
 if __name__ == "__main__":
